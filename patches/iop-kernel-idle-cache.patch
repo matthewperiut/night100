@@ -1,0 +1,129 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..fddd2b6 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -25,6 +25,7 @@ namespace ps2x::iop::detail
+
+     void IopKernel::reset()
+     {
++        m_idleUntil = 0;
+         m_threads.clear();
+         m_semaphores.clear();
+         m_eventFlags.clear();
+@@ -36,6 +37,7 @@ namespace ps2x::iop::detail
+
+     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+     {
++        m_idleUntil = 0;
+         const auto setV0 = [&](int32_t value)
+         {
+             cpu.gpr[2] = static_cast<uint32_t>(value);
+@@ -352,6 +354,7 @@ namespace ps2x::iop::detail
+
+     bool IopKernel::dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu)
+     {
++        m_idleUntil = 0;
+         const auto setV0 = [&](int32_t value)
+         {
+             cpu.gpr[2] = static_cast<uint32_t>(value);
+@@ -504,6 +507,7 @@ namespace ps2x::iop::detail
+
+     int IopKernel::createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits)
+     {
++        m_idleUntil = 0;
+         EventFlag event;
+         event.id = static_cast<int>(m_nextEventFlagId++);
+         event.attr = attr;
+@@ -516,6 +520,7 @@ namespace ps2x::iop::detail
+
+     bool IopKernel::setInternalEventFlag(int id, uint32_t bits)
+     {
++        m_idleUntil = 0;
+         const auto event = m_eventFlags.find(id);
+         if (event == m_eventFlags.end())
+             return false;
+@@ -526,6 +531,7 @@ namespace ps2x::iop::detail
+
+     bool IopKernel::dispatchEventImport(uint16_t ordinal, IopCpuState &cpu)
+     {
++        m_idleUntil = 0;
+         const auto setV0 = [&](int32_t value)
+         {
+             cpu.gpr[2] = static_cast<uint32_t>(value);
+@@ -654,6 +660,7 @@ namespace ps2x::iop::detail
+
+     void IopKernel::sleepCurrent(IopCpuState &cpu)
+     {
++        m_idleUntil = 0;
+         if (m_currentThread == nullptr)
+             return;
+         m_currentThread->state = IopThreadState::Sleep;
+@@ -662,6 +669,7 @@ namespace ps2x::iop::detail
+
+     void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu)
+     {
++        m_idleUntil = 0;
+         if (m_currentThread == nullptr)
+             return;
+         m_currentThread->wakeCycle = wakeCycle;
+@@ -671,10 +679,16 @@ namespace ps2x::iop::detail
+
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
++        if (currentCycle < m_idleUntil) return nullptr;
++        m_idleUntil = 0;
++        uint64_t nextWake = UINT64_MAX;
+         for (auto &[id, thread] : m_threads)
+         {
+-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
+-                thread.state = IopThreadState::Ready;
++            if (thread.state == IopThreadState::Delay)
++            {
++                if (thread.wakeCycle <= currentCycle) thread.state = IopThreadState::Ready;
++                else nextWake = std::min(nextWake, thread.wakeCycle);
++            }
+         }
+
+         IopThread *next = nullptr;
+@@ -687,7 +701,10 @@ namespace ps2x::iop::detail
+                 next = &thread;
+         }
+         if (next == nullptr)
++        {
++            m_idleUntil = nextWake;
+             return nullptr;
++        }
+
+         m_currentThread = next;
+         next->state = IopThreadState::Running;
+@@ -698,6 +715,7 @@ namespace ps2x::iop::detail
+
+     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
+     {
++        if (m_idleUntil) return std::min(fallback, m_idleUntil);
+         uint64_t nextWake = fallback;
+         for (const auto &[id, thread] : m_threads)
+         {
+@@ -709,6 +727,7 @@ namespace ps2x::iop::detail
+
+     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
+     {
++        m_idleUntil = 0;
+         if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
+             thread.state = IopThreadState::Dormant;
+         else if (thread.state == IopThreadState::Running)
+@@ -719,5 +738,6 @@ namespace ps2x::iop::detail
+
+     void IopKernel::cleanupDeadThreads()
+     {
++        m_idleUntil = 0;
+         for (auto thread = m_threads.begin(); thread != m_threads.end();)
+         {
+@@ -734,6 +754,7 @@ namespace ps2x::iop::detail
+
+     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
+     {
++        m_idleUntil = 0;
+         for (auto &[id, thread] : m_threads)
+         {
+             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);

@@ -1,0 +1,321 @@
+diff --git a/ps2xRuntime/include/runtime/resource_disc.h b/ps2xRuntime/include/runtime/resource_disc.h
+--- a/ps2xRuntime/include/runtime/resource_disc.h
++++ b/ps2xRuntime/include/runtime/resource_disc.h
+@@ -7,14 +7,54 @@
+ 
+ namespace ps2x {
+ 
++// Process-wide cache of source files referenced by compact discs.
++//  * Off (default): every read streams from the source file, as before.
++//  * WholeFile: a source file is loaded entirely on first access, and later reads
++//    are served from memory. Least-recently-used whole files are evicted when the
++//    cap is exceeded. A file larger than the cap is never cached and keeps streaming.
++//  * WholeFilePrefetch: as WholeFile, and each disc opened afterwards loads every
++//    source file its manifest lists, in manifest order, while they fit under the cap.
++//    The manifest describes the whole disc, not scenes, so this is not per-scene.
++// Cached files are assumed immutable while cached. Changing a source file on disk
++// while the cache holds it is not detected.
++enum class ResourceCacheMode : uint8_t {
++    Off = 0,
++    WholeFile = 1,
++    WholeFilePrefetch = 2,
++};
++
++struct ResourceCacheStats {
++    uint64_t files = 0;     // whole files currently resident
++    uint64_t bytes = 0;     // bytes of resident files
++    uint64_t loads = 0;     // whole-file loads since the mode was set
++    uint64_t hits = 0;      // reads served from a resident file
++    uint64_t evictions = 0; // resident files removed to honor the cap
++    uint64_t uncached = 0;  // loads declined: over the cap, or no room without eviction
++};
++
+ // A lossless logical disc assembled from loose assets and bounded gap blocks.
+ // open returns null for an ordinary file/directory. Recognized corrupt manifests
+ // throw, so a broken package cannot silently become a different disc image.
++//
++// Threading: read() and prefetch() may be called from any thread. Each disc
++// serializes its reads on an internal mutex. open() is also thread-safe. The
++// cache is process-wide and internally synchronized.
+ class ResourceDisc {
+ public:
++    static constexpr uint64_t kDefaultCacheBytes = 512ull * 1024ull * 1024ull;
++
++    // Sets the process-wide cache policy. Drops every resident file and resets the
++    // statistics, whatever the new mode is. Callers should set the mode once, at startup.
++    static void setCacheMode(ResourceCacheMode mode, uint64_t capBytes = kDefaultCacheBytes);
++    [[nodiscard]] static ResourceCacheMode cacheMode() noexcept;
++    [[nodiscard]] static ResourceCacheStats cacheStats();
++
+     static std::shared_ptr<ResourceDisc> open(const std::filesystem::path& path);
+     ~ResourceDisc();
+     uint64_t size() const noexcept;
++    // Loads every source file this disc lists that fits under the cap, without evicting.
++    // Does nothing unless the cache is enabled.
++    void prefetch();
+     // Like fread: EOF is a successful short read; errors return false.
+     bool read(uint64_t offset, void* destination, size_t length, size_t& bytesRead);
+ 
+diff --git a/ps2xRuntime/src/lib/resource_disc.cpp b/ps2xRuntime/src/lib/resource_disc.cpp
+--- a/ps2xRuntime/src/lib/resource_disc.cpp
++++ b/ps2xRuntime/src/lib/resource_disc.cpp
+@@ -6,7 +6,9 @@
+ #include <cstring>
+ #include <fstream>
+ #include <limits>
++#include <atomic>
+ #include <list>
++#include <memory>
+ #include <mutex>
+ #include <stdexcept>
+ #include <string>
+@@ -50,6 +52,108 @@
+ #else
+     return std::fopen(path.c_str(),"rb");
+ #endif
++}
++}
++
++namespace {
++using SharedBytes=std::shared_ptr<const std::vector<uint8_t>>;
++
++// Process-wide whole-file cache. Lock order, outermost first:
++//   open cache mutex -> disc mutex -> loadMutex -> mutex.
++// `mutex` guards the index, LRU, statistics and mode, and is only held for
++// in-memory bookkeeping. It is never held during file I/O, so statistics and mode
++// queries from other threads cannot block behind a load. `loadMutex` serializes
++// loads so a file is read once. The off path takes no lock at all.
++struct FileCache {
++    struct Entry { std::string key; SharedBytes data; };
++    std::atomic<uint8_t> mode{static_cast<uint8_t>(ResourceCacheMode::Off)};
++    std::mutex mutex;
++    std::mutex loadMutex;
++    uint64_t capacity=0;
++    uint64_t bytes=0;
++    std::list<Entry> lru; // front is most recently used
++    std::unordered_map<std::string,std::list<Entry>::iterator> index;
++    ResourceCacheStats stats;
++
++    void evictWhileOver(uint64_t incoming) { // requires mutex
++        while(!lru.empty() && bytes+incoming>capacity) {
++            bytes-=lru.back().data->size();
++            index.erase(lru.back().key);
++            lru.pop_back();
++            ++stats.evictions;
++        }
++    }
++    // Looks up a resident file under mutex; promotes it on a hit.
++    SharedBytes lookupLocked(const std::string& key) {
++        auto found=index.find(key);
++        if(found==index.end())return {};
++        lru.splice(lru.begin(),lru,found->second);
++        ++stats.hits;
++        return found->second->data;
++    }
++    // Reads the whole file in bounded chunks, checking every return value. Runs with
++    // no cache mutex held. Returns null on any short or failed read.
++    static SharedBytes loadWholeFile(const std::filesystem::path& path,uint64_t size) {
++        FILE* stream=openFile(path);
++        if(!stream)return {};
++        auto data=std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(size));
++        constexpr size_t chunkBytes=1024u*1024u;
++        size_t done=0;
++        bool ok=true;
++        std::clearerr(stream);
++        while(done<data->size()) {
++            const size_t want=std::min(chunkBytes,data->size()-done);
++            const size_t got=std::fread(data->data()+done,1,want,stream);
++            if(got==0) {ok=false;break;}
++            done+=got;
++        }
++        if(std::ferror(stream))ok=false;
++        std::fclose(stream);
++        return ok && done==data->size() ? data : SharedBytes{};
++    }
++    SharedBytes acquire(const std::filesystem::path& path,bool allowEvict) {
++        if(mode.load(std::memory_order_relaxed)==static_cast<uint8_t>(ResourceCacheMode::Off))return {};
++        const std::string key=path.string();
++        {
++            std::lock_guard lock(mutex);
++            if(auto hit=lookupLocked(key))return hit;
++        }
++        std::lock_guard load(loadMutex);
++        uint64_t limit=0;
++        {
++            std::lock_guard lock(mutex);
++            // Another thread may have loaded it while this one waited for loadMutex.
++            if(auto hit=lookupLocked(key))return hit;
++            limit=capacity;
++        }
++        std::error_code error;
++        const uint64_t size=std::filesystem::file_size(path,error);
++        if(error || size>limit) {
++            std::lock_guard lock(mutex);
++            ++stats.uncached;
++            return {};
++        }
++        SharedBytes data=loadWholeFile(path,size); // I/O with no cache mutex held
++        std::lock_guard lock(mutex);
++        if(!data || mode.load(std::memory_order_relaxed)==static_cast<uint8_t>(ResourceCacheMode::Off)) {
++            ++stats.uncached;
++            return {};
++        }
++        if(size>capacity || (!allowEvict && bytes+size>capacity)) {
++            ++stats.uncached;
++            return {};
++        }
++        if(allowEvict)evictWhileOver(size);
++        lru.push_front({key,data});
++        index[key]=lru.begin();
++        bytes+=size;
++        ++stats.loads;
++        return data;
++    }
++};
++FileCache& fileCache() {
++    static FileCache cache;
++    return cache;
+ }
+ }
+ 
+@@ -64,10 +168,23 @@
+     std::vector<Extent> extents;
+     std::list<File> files;
+     size_t blockIndex=std::numeric_limits<size_t>::max();
++    // Scratch reused by every block decode. Only read() reaches these, under mutex.
+     std::vector<uint8_t> inflated;
++    std::vector<uint8_t> compressed;
++    z_stream stream{};
++    bool streamReady=false;
+     std::mutex mutex;
+-    ~Impl() { for(auto& file:files)std::fclose(file.stream); }
++    ~Impl() {
++        for(auto& file:files)std::fclose(file.stream);
++        if(streamReady)inflateEnd(&stream);
++    }
+     bool readFile(const Extent& extent,uint64_t within,void* out,size_t length) {
++        if(auto data=fileCache().acquire(extent.path,true)) {
++            const uint64_t start=extent.offset+within;
++            if(start>data->size() || length>data->size()-start)return false;
++            std::memcpy(out,data->data()+start,length);
++            return true;
++        }
+         auto found=std::find_if(files.begin(),files.end(),[&](const auto& file){return file.path==extent.path;});
+         if(found==files.end()) {
+             FILE* stream=openFile(extent.path);if(!stream)return false;
+@@ -81,19 +198,26 @@
+     }
+     bool decode(size_t index) {
+         if(blockIndex==index)return true;
++        // Invalidate first: a failed decode overwrites the scratch block.
++        blockIndex=std::numeric_limits<size_t>::max();
+         const auto& extent=extents[index];
+-        std::vector<uint8_t> compressed(static_cast<size_t>(extent.stored));
++        compressed.resize(static_cast<size_t>(extent.stored));
+         if(!readFile(extent,0,compressed.data(),compressed.size()))return false;
+-        std::vector<uint8_t> output(static_cast<size_t>(extent.length));
+-        z_stream stream{};
++        inflated.resize(static_cast<size_t>(extent.length));
++        if(!streamReady) {
++            stream=z_stream{};
++            if(inflateInit(&stream)!=Z_OK)return false;
++            streamReady=true;
++        } else if(inflateReset(&stream)!=Z_OK) {
++            return false;
++        }
+         stream.next_in=compressed.data();stream.avail_in=static_cast<uInt>(compressed.size());
+-        stream.next_out=output.data();stream.avail_out=static_cast<uInt>(output.size());
+-        if(inflateInit(&stream)!=Z_OK)return false;
++        stream.next_out=inflated.data();stream.avail_out=static_cast<uInt>(inflated.size());
+         const int result=inflate(&stream,Z_FINISH);
+-        const bool valid=result==Z_STREAM_END && stream.total_in==compressed.size() && stream.total_out==output.size();
+-        inflateEnd(&stream);
++        const bool valid=result==Z_STREAM_END && stream.total_in==compressed.size() && stream.total_out==inflated.size();
+         if(!valid)return false;
+-        inflated=std::move(output);blockIndex=index;return true;
++        blockIndex=index;
++        return true;
+     }
+ };
+ 
+@@ -101,6 +225,37 @@
+ ResourceDisc::~ResourceDisc()=default;
+ uint64_t ResourceDisc::size() const noexcept {return m_impl->logicalSize;}
+ 
++void ResourceDisc::setCacheMode(ResourceCacheMode mode,uint64_t capBytes) {
++    auto& cache=fileCache();
++    std::lock_guard lock(cache.mutex);
++    cache.stats=ResourceCacheStats{};
++    cache.capacity=mode==ResourceCacheMode::Off?0:capBytes;
++    cache.lru.clear();
++    cache.index.clear();
++    cache.bytes=0;
++    cache.mode.store(static_cast<uint8_t>(mode),std::memory_order_relaxed);
++    cache.evictWhileOver(0);
++}
++
++ResourceCacheMode ResourceDisc::cacheMode() noexcept {
++    return static_cast<ResourceCacheMode>(fileCache().mode.load(std::memory_order_relaxed));
++}
++
++ResourceCacheStats ResourceDisc::cacheStats() {
++    auto& cache=fileCache();
++    std::lock_guard lock(cache.mutex);
++    ResourceCacheStats result=cache.stats;
++    result.files=cache.index.size();
++    result.bytes=cache.bytes;
++    return result;
++}
++
++void ResourceDisc::prefetch() {
++    if(cacheMode()==ResourceCacheMode::Off)return;
++    for(const auto& extent:m_impl->extents)
++        if(extent.encoding!=1)fileCache().acquire(extent.path,false);
++}
++
+ std::shared_ptr<ResourceDisc> ResourceDisc::open(const std::filesystem::path& input) {
+     const auto key=(input.is_absolute()?input:std::filesystem::absolute(input)).lexically_normal();
+     struct Cached {std::filesystem::path input,manifest;std::shared_ptr<ResourceDisc> disc;};
+@@ -177,6 +332,7 @@
+     }
+     if(next!=impl->logicalSize || cursor.position!=bytes.size())invalid("incomplete coverage or trailing manifest bytes");
+     auto result=std::shared_ptr<ResourceDisc>(new ResourceDisc(std::move(impl)));
++    if(cacheMode()==ResourceCacheMode::WholeFilePrefetch)result->prefetch();
+     cache.push_front({key,manifest,result});if(cache.size()>8)cache.pop_back();return result;
+ }
+ 
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -33,6 +33,7 @@
+ #include "runtime/ps2_pad.h"
+ #include "runtime/ps2_rom_device.h"
+ #include "runtime/ps2_vfs.h"
++#include "runtime/resource_disc.h"
+ #include "ps2x/iop/iop_types.h"
+ #include "ps2x/iop/iop_clock.h"
+ 
+@@ -322,6 +323,8 @@
+     void quiesceIop() const;
+     // Cumulative IOP cycle accounting by thread. Read it at completed-frame boundaries.
+     [[nodiscard]] ps2x::iop::IopExecutionStats iopExecutionStats() const;
++    // Process-wide policy for compact-disc source files. Off by default. See resource_disc.h.
++    void setResourceCacheMode(ps2x::ResourceCacheMode mode, uint64_t capBytes = ps2x::ResourceDisc::kDefaultCacheBytes);
+     // Enables or disables the IOP worker thread. Disabling quiesces and joins it.
+     void setIopWorkerEnabled(bool enabled);
+     // Start hook for the worker thread (for example, core pinning). Set before enabling.
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -672,6 +672,11 @@
+         m_iopSubsystem->quiesce();
+ }
+ 
++void PS2Runtime::setResourceCacheMode(ps2x::ResourceCacheMode mode, uint64_t capBytes)
++{
++    ps2x::ResourceDisc::setCacheMode(mode, capBytes);
++}
++
+ ps2x::iop::IopExecutionStats PS2Runtime::iopExecutionStats() const
+ {
+     return m_iopSubsystem->executionStats();

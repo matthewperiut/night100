@@ -1,0 +1,1416 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -8,6 +8,8 @@
+     src/ps2_path.cpp
+     src/iop_module_manager.cpp
+     src/iop_subsystem.cpp
++    src/iop_worker.cpp
++    src/iop_routed_host.cpp
+     src/emulator/iop_emulator.cpp
+     src/emulator/core/iop_cpu.cpp
+     src/emulator/core/iop_kernel.cpp
+@@ -31,6 +33,8 @@
+ )
+ 
+ target_compile_features(ps2_iop PUBLIC cxx_std_20)
++find_package(Threads REQUIRED)
++target_link_libraries(ps2_iop PUBLIC Threads::Threads)
+ 
+ target_include_directories(ps2_iop
+     PUBLIC
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -3,6 +3,7 @@
+ #include "ps2x/iop/iop_host.h"
+ #include "ps2x/iop/iop_types.h"
+ 
++#include <functional>
+ #include <memory>
+ #include <span>
+ #include <string>
+@@ -11,6 +12,19 @@
+ 
+ namespace ps2x::iop
+ {
++    // Cycle accounting by thread, cumulative since construction. The worker columns
++    // count IOP work on the worker thread; the EE columns count IOP work that ran on the
++    // EE thread (worker disabled, or suspended inside an EE job).
++    struct IopExecutionStats
++    {
++        uint64_t workerCredits = 0;   // EE cycle credits executed on the worker
++        uint64_t workerJobs = 0;      // EE-requested IOP jobs (RPC, module, SIF) executed on the worker
++        uint64_t workerCycles = 0;    // IOP cycles executed on the worker, credit and jobs
++        uint64_t eeInlineCredits = 0; // credits executed on the EE thread (worker disabled)
++        uint64_t eeInlineJobs = 0;    // IOP jobs executed on the EE thread
++        uint64_t eeInlineCycles = 0;  // IOP cycles executed on the EE thread
++    };
++
+     class IopSubsystem
+     {
+     public:
+@@ -31,6 +45,19 @@
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
+         void runEeCycles(uint64_t eeCycles) noexcept;
+ 
++        // Optional IOP execution thread. When enabled, runEeCycles() queues credit
++        // and returns; every other entry point waits for queued credit first.
++        // quantumCycles is the EE-cycle quantum at which the EE waits for the IOP
++        // to drain. Disabling joins the thread.
++        void setWorkerEnabled(bool enabled, uint64_t quantumCycles = 294912u);
++        // Runs once on the worker thread before its first credit. Affects the next
++        // setWorkerEnabled(true). Used by platforms to pin the thread.
++        void setWorkerThreadHook(std::function<void()> hook);
++        [[nodiscard]] IopExecutionStats executionStats() const;
++        [[nodiscard]] bool workerEnabled() const noexcept;
++        // Waits until all queued IOP credit has executed and EE callbacks are serviced.
++        void quiesce() const;
++
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -6,8 +6,12 @@
+ #include "emulator/iop_emulator.h"
+ #include "module_factories.h"
+ #include "ps2x/iop/ps2_path.h"
++#include "ps2x/iop/iop_worker.h"
++#include "ps2x/iop/iop_routed_host.h"
+ 
++#include <atomic>
+ #include <sstream>
++#include <type_traits>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+@@ -19,11 +23,12 @@
+     public:
+         explicit Impl(IopHost &hostRef)
+             : host(hostRef),
+-              emulator(hostRef)
++              routed(hostRef),
++              emulator(routed)
+         {
+-            coreServices.emplace_back(detail::createMcservService(host));
+-            coreServices.emplace_back(detail::createDbcmanService(host));
+-            coreServices.emplace_back(detail::createLibSdService(host));
++            coreServices.emplace_back(detail::createMcservService(routed));
++            coreServices.emplace_back(detail::createDbcmanService(routed));
++            coreServices.emplace_back(detail::createLibSdService(routed));
+             refreshServiceModuleKeys();
+             rebuildRoutes();
+         }
+@@ -80,6 +85,8 @@
+         }
+ 
+         IopHost &host;
++        // Every host call the emulator and services make goes through this wrapper.
++        IopEeRoutedHost routed;
+         detail::ServiceList coreServices;
+         std::unordered_map<uint32_t, detail::IopService *> routes;
+         std::vector<std::string> loadOutcomes;
+@@ -87,6 +94,72 @@
+         std::string lastError;
+         detail::IopModuleManager moduleManager;
+         detail::IopEmulator emulator;
++        // Declared last so the worker joins before the emulator it executes is destroyed.
++        std::unique_ptr<ps2x::iop::IopWorker> worker;
++        std::function<void()> workerThreadHook;
++
++        // Cycle accounting by thread. Relaxed atomics, read by executionStats().
++        struct Counters
++        {
++            std::atomic<uint64_t> workerCredits{0};
++            std::atomic<uint64_t> workerJobs{0};
++            std::atomic<uint64_t> workerCycles{0};
++            std::atomic<uint64_t> eeInlineCredits{0};
++            std::atomic<uint64_t> eeInlineJobs{0};
++            std::atomic<uint64_t> eeInlineCycles{0};
++        } counters;
++
++        // Runs IOP work requested by the EE thread. It runs on the worker, which owns IOP
++        // state, unless no worker exists or the EE thread is inside a blocking job the worker
++        // requested. Then the worker is suspended on this stack, and the work runs inline.
++        template <class F>
++        auto onIopThread(F &&f) -> std::invoke_result_t<F &>
++        {
++            using Result = std::invoke_result_t<F &>;
++            if (ps2x::iop::IopWorker::onWorkerThread())
++                return f();
++            if (!worker || worker->eeInsideBlockingJob())
++            {
++                counters.eeInlineJobs.fetch_add(1u, std::memory_order_relaxed);
++                const uint64_t before = emulator.cycles();
++                if constexpr (std::is_void_v<Result>)
++                {
++                    f();
++                    counters.eeInlineCycles.fetch_add(emulator.cycles() - before, std::memory_order_relaxed);
++                    return;
++                }
++                else
++                {
++                    Result result = f();
++                    counters.eeInlineCycles.fetch_add(emulator.cycles() - before, std::memory_order_relaxed);
++                    return result;
++                }
++            }
++            return worker->runOnWorker([this, &f]() -> Result {
++                counters.workerJobs.fetch_add(1u, std::memory_order_relaxed);
++                const uint64_t before = emulator.cycles();
++                if constexpr (std::is_void_v<Result>)
++                {
++                    f();
++                    counters.workerCycles.fetch_add(emulator.cycles() - before, std::memory_order_relaxed);
++                    return;
++                }
++                else
++                {
++                    Result result = f();
++                    counters.workerCycles.fetch_add(emulator.cycles() - before, std::memory_order_relaxed);
++                    return result;
++                }
++            });
++        }
++
++        // EE-visible operations first drain credits already handed to the worker.
++        // The worker itself is inside the IOP and must not wait for its own queue.
++        void drainWorker() const
++        {
++            if (worker)
++                worker->quiesce();
++        }
+     };
+ 
+     IopSubsystem::IopSubsystem(IopHost &host)
+@@ -94,12 +167,17 @@
+     {
+     }
+ 
+-    IopSubsystem::~IopSubsystem() = default;
++    IopSubsystem::~IopSubsystem()
++    {
++        if (m_impl)
++            m_impl->worker.reset();
++    }
+     IopSubsystem::IopSubsystem(IopSubsystem &&) noexcept = default;
+     IopSubsystem &IopSubsystem::operator=(IopSubsystem &&) noexcept = default;
+ 
+-    void IopSubsystem::reset()
++void IopSubsystem::reset()
+     {
++        m_impl->drainWorker();
+         m_impl->moduleManager.reset();
+         m_impl->loadOutcomes.clear();
+         m_impl->loggedLoadPaths.clear();
+@@ -115,63 +193,129 @@
+         m_impl->rebuildRoutes();
+     }
+ 
+-    ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
++ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
+-        const ParsedPs2Path parsed = parsePs2Path(path);
+-        if (!parsed)
+-            return {true, -1, -1};
++    return m_impl->onIopThread([&]() -> ModuleLoadResult {
++            const ParsedPs2Path parsed = parsePs2Path(path);
++            if (!parsed)
++                return {true, -1, -1};
+ 
+-        if (parsed.device != Ps2PathDevice::Rom0)
+-        {
+-            ModuleLoadResult physical = m_impl->emulator.loadModule(path, arguments, argumentSize);
+-            if (physical.moduleId > 0)
++            if (parsed.device != Ps2PathDevice::Rom0)
+             {
+-                m_impl->moduleManager.observePhysicalLoad(physical.moduleId, path);
+-                m_impl->rebuildRoutes();
+-                return physical;
++                ModuleLoadResult physical = m_impl->emulator.loadModule(path, arguments, argumentSize);
++                if (physical.moduleId > 0)
++                {
++                    m_impl->moduleManager.observePhysicalLoad(physical.moduleId, path);
++                    m_impl->rebuildRoutes();
++                    return physical;
++                }
+             }
+-        }
+ 
+-        ModuleLoadResult hle = m_impl->moduleManager.loadHle(path);
+-        if (hle.moduleId > 0)
+-        {
+-            m_impl->rebuildRoutes();
+-            if (parsed.device != Ps2PathDevice::Rom0)
+-                m_impl->recordLoadOutcome(path, true);
+-        }
+-        else
+-        {
+-            m_impl->recordLoadOutcome(path, false);
+-        }
+-        return hle;
++            ModuleLoadResult hle = m_impl->moduleManager.loadHle(path);
++            if (hle.moduleId > 0)
++            {
++                m_impl->rebuildRoutes();
++                if (parsed.device != Ps2PathDevice::Rom0)
++                    m_impl->recordLoadOutcome(path, true);
++            }
++            else
++            {
++                m_impl->recordLoadOutcome(path, false);
++            }
++            return hle;
++    });
+     }
+ 
+     ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+     {
+-        return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
++        return m_impl->onIopThread([&]() -> ModuleLoadResult {
++            return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
++        });
+     }
+ 
+     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
+     {
+-        if (m_impl->moduleManager.stopHle(moduleId, result))
+-        {
++        return m_impl->onIopThread([&]() -> bool {
++            if (m_impl->moduleManager.stopHle(moduleId, result))
++            {
++                m_impl->rebuildRoutes();
++                return true;
++            }
++            if (!m_impl->emulator.stopModule(moduleId, result))
++                return false;
++            m_impl->moduleManager.observePhysicalStop(moduleId);
+             m_impl->rebuildRoutes();
+             return true;
+-        }
+-        if (!m_impl->emulator.stopModule(moduleId, result))
+-            return false;
+-        m_impl->moduleManager.observePhysicalStop(moduleId);
+-        m_impl->rebuildRoutes();
+-        return true;
++        });
+     }
+ 
+     void IopSubsystem::runEeCycles(uint64_t eeCycles) noexcept
+     {
++        if (m_impl->worker)
++        {
++            m_impl->worker->submit(eeCycles);
++            return;
++        }
++        const uint64_t before = m_impl->emulator.cycles();
+         m_impl->emulator.runEeCycles(eeCycles);
++        if (eeCycles)
++        {
++            m_impl->counters.eeInlineCredits.fetch_add(1u, std::memory_order_relaxed);
++            m_impl->counters.eeInlineCycles.fetch_add(m_impl->emulator.cycles() - before, std::memory_order_relaxed);
++        }
+     }
+ 
++    ps2x::iop::IopExecutionStats IopSubsystem::executionStats() const
++    {
++        const auto &c = m_impl->counters;
++        IopExecutionStats stats;
++        stats.workerCredits = c.workerCredits.load(std::memory_order_relaxed);
++        stats.workerJobs = c.workerJobs.load(std::memory_order_relaxed);
++        stats.workerCycles = c.workerCycles.load(std::memory_order_relaxed);
++        stats.eeInlineCredits = c.eeInlineCredits.load(std::memory_order_relaxed);
++        stats.eeInlineJobs = c.eeInlineJobs.load(std::memory_order_relaxed);
++        stats.eeInlineCycles = c.eeInlineCycles.load(std::memory_order_relaxed);
++        return stats;
++    }
++
++    void IopSubsystem::setWorkerEnabled(bool enabled, uint64_t quantumCycles)
++    {
++        if (!enabled)
++        {
++            m_impl->worker.reset();
++            return;
++        }
++        if (m_impl->worker)
++            return;
++        m_impl->worker = std::make_unique<ps2x::iop::IopWorker>(
++            [impl = m_impl.get()](uint64_t credit) {
++                const uint64_t before = impl->emulator.cycles();
++                impl->emulator.runEeCycles(credit);
++                impl->counters.workerCredits.fetch_add(1u, std::memory_order_relaxed);
++                impl->counters.workerCycles.fetch_add(impl->emulator.cycles() - before, std::memory_order_relaxed);
++            },
++            quantumCycles,
++            m_impl->workerThreadHook);
++    }
++
++    void IopSubsystem::setWorkerThreadHook(std::function<void()> hook)
++    {
++        m_impl->workerThreadHook = std::move(hook);
++    }
++
++    bool IopSubsystem::workerEnabled() const noexcept
++    {
++        return m_impl->worker != nullptr;
++    }
++
++    void IopSubsystem::quiesce() const
++    {
++        m_impl->drainWorker();
++    }
++
+     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
+     {
++        m_impl->drainWorker();
+         for (const auto &service : m_impl->coreServices)
+         {
+             if (service && m_impl->serviceActive(*service))
+@@ -188,6 +332,7 @@
+ 
+     bool IopSubsystem::canBindRpc(uint32_t sid) const noexcept
+     {
++        m_impl->drainWorker();
+         if (m_impl->routes.find(sid) != m_impl->routes.end())
+         {
+             return true;
+@@ -197,61 +342,72 @@
+ 
+     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
+     {
+-        const auto route = m_impl->routes.find(request.sid);
+-        detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
++        return m_impl->onIopThread([&]() -> RpcResult {
++            const auto route = m_impl->routes.find(request.sid);
++            detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
+ 
+-        RpcResult emulated = m_impl->emulator.handleRpc(request);
+-        if (emulated.handled || !hle)
+-        {
+-            return emulated;
+-        }
+-        return hle->handleRpc(request);
++            RpcResult emulated = m_impl->emulator.handleRpc(request);
++            if (emulated.handled || !hle)
++            {
++                return emulated;
++            }
++            return hle->handleRpc(request);
++        });
+     }
+ 
+     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
+     {
+-        for (auto &service : m_impl->coreServices)
+-        {
+-            if (service && m_impl->serviceActive(*service))
++        return m_impl->onIopThread([&]() -> void {
++            for (auto &service : m_impl->coreServices)
+             {
+-                service->onSifTransfer(transfer);
++                if (service && m_impl->serviceActive(*service))
++                {
++                    service->onSifTransfer(transfer);
++                }
+             }
+-        }
+-        m_impl->emulator.onSifTransfer(transfer);
++            m_impl->emulator.onSifTransfer(transfer);
++        });
+     }
+ 
+     uint32_t IopSubsystem::allocateMemory(uint32_t size, uint32_t alignment)
+     {
++        m_impl->drainWorker();
+         return m_impl->emulator.allocateMemory(size, alignment);
+     }
+ 
+     bool IopSubsystem::freeMemory(uint32_t address)
+     {
++        m_impl->drainWorker();
+         return m_impl->emulator.freeMemory(address);
+     }
+ 
+     bool IopSubsystem::readMemory(uint32_t address, void *destination, size_t size) const
+     {
++        m_impl->drainWorker();
+         return m_impl->emulator.readMemory(address, destination, size);
+     }
+ 
+     bool IopSubsystem::writeMemory(uint32_t address, const void *source, size_t size)
+     {
++        m_impl->drainWorker();
+         return m_impl->emulator.writeMemory(address, source, size);
+     }
+ 
+     bool IopSubsystem::zeroMemory(uint32_t address, size_t size)
+     {
++        m_impl->drainWorker();
+         return m_impl->emulator.zeroMemory(address, size);
+     }
+ 
+     bool IopSubsystem::isMemoryRange(uint32_t address, size_t size) const
+     {
++        m_impl->drainWorker();
+         return m_impl->emulator.isMemoryRange(address, size);
+     }
+ 
+     DebugSnapshot IopSubsystem::debugSnapshot() const
+     {
++        m_impl->drainWorker();
+         DebugSnapshot snapshot;
+         snapshot.emulatorCycles = m_impl->emulator.cycles();
+         snapshot.emulatorInstructions = m_impl->emulator.instructions();
+@@ -276,12 +432,14 @@
+         return snapshot;
+     }
+     std::vector<uint8_t> IopSubsystem::saveState() const {
++        m_impl->drainWorker();
+         ps2x::state::Writer ar;uint32_t version=2;ar(version,detail::IopEmulator::stateAbi(),m_impl->moduleManager,m_impl->loadOutcomes,m_impl->loggedLoadPaths,m_impl->lastError);
+         const auto emulator=m_impl->emulator.saveState();ar(emulator,uint64_t(m_impl->coreServices.size()));
+         for(const auto& service:m_impl->coreServices){const std::string name(service->name());const auto bytes=service->saveState();ar(name,bytes);}
+         return std::move(ar.data);
+     }
+     void IopSubsystem::loadState(std::span<const uint8_t> data) {
++        m_impl->drainWorker();
+         ps2x::state::Reader ar(data);uint32_t version=0;ar(version);if(version!=2)throw std::runtime_error("Unsupported IOP subsystem state version");
+         std::vector<uint64_t> abi;ar(abi);if(abi!=detail::IopEmulator::stateAbi())throw std::runtime_error("Incompatible IOP subsystem POD ABI");
+         ar(m_impl->moduleManager,m_impl->loadOutcomes,m_impl->loggedLoadPaths,m_impl->lastError);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -27,6 +27,7 @@
+ #include <fstream>
+ #include <algorithm>
+ #include <array>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <chrono>
+@@ -506,6 +507,12 @@
+ {
+     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
+     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
++#if !defined(__SWITCH__)
++    // Desktop only: NIGHT100_IOP_WORKER=1 runs IOP credit on its own thread. Default off.
++    // The Switch has no environment and enables the worker through setIopWorkerEnabled.
++    if (const char *worker = std::getenv("NIGHT100_IOP_WORKER"); worker && worker[0] && worker[0] != '0')
++        m_iopSubsystem->setWorkerEnabled(true);
++#endif
+ 
+     m_eeScheduler = std::make_unique<EeScheduler>(*this);
+ 
+@@ -657,8 +664,29 @@
+         CpuWorkProfile::Scope work(CpuWorkProfile::Phase::Iop);
+         m_iopSubsystem->runEeCycles(credit);
+     }
++}
++
++void PS2Runtime::quiesceIop() const
++{
++    if (m_iopSubsystem)
++        m_iopSubsystem->quiesce();
++}
++
++ps2x::iop::IopExecutionStats PS2Runtime::iopExecutionStats() const
++{
++    return m_iopSubsystem->executionStats();
+ }
+ 
++void PS2Runtime::setIopWorkerEnabled(bool enabled)
++{
++    m_iopSubsystem->setWorkerEnabled(enabled);
++}
++
++void PS2Runtime::setIopWorkerThreadHook(std::function<void()> hook)
++{
++    m_iopSubsystem->setWorkerThreadHook(std::move(hook));
++}
++
+ void PS2Runtime::resetIop()
+ {
+     m_iopSubsystem->reset();
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_iop_host.h"
++#include "ps2x/iop/iop_worker.h"
+ #include "runtime/state_archive.h"
+ 
+ #include "ps2_runtime.h"
+@@ -10,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <vector>
+ #include <filesystem>
+ #include <iostream>
+ #include <limits>
+@@ -19,6 +21,18 @@
+ #include <sys/types.h>
+ #endif
+ 
++namespace
++{
++    // EE main memory. Worker-side writes and clears inside this range are queued
++    // to the EE thread; larger or mirrored ranges keep the blocking EE call.
++    constexpr uint64_t kDeferrableGuestBytes = 0x02000000u;
++
++    bool deferrableGuestRange(uint32_t address, size_t size)
++    {
++        return address < kDeferrableGuestBytes && size <= kDeferrableGuestBytes - address;
++    }
++}
++
+ PS2IopHostAdapter::CallScope::CallScope(PS2IopHostAdapter &owner, R5900Context *context, uint8_t *rdram)
+     : m_lock(owner.m_callMutex),
+       m_owner(&owner),
+@@ -137,6 +151,8 @@
+ 
+ bool PS2IopHostAdapter::readGuest(uint32_t address, void *destination, size_t size) const
+ {
++    if (ps2x::iop::IopWorker::onWorkerThread())
++        return ps2x::iop::IopWorker::eeCall([&] { return readGuest(address, destination, size); });
+     if (!destination && size != 0)
+     {
+         return false;
+@@ -155,6 +171,21 @@
+ 
+ bool PS2IopHostAdapter::writeGuest(uint32_t address, const void *source, size_t size)
+ {
++    if (ps2x::iop::IopWorker::onWorkerThread())
++    {
++        // The IOP ignores the success of SIF data copies except as an error path,
++        // so the write is queued in order and reported as accepted.
++        if (source && deferrableGuestRange(address, size))
++        {
++            const auto *bytes = static_cast<const uint8_t *>(source);
++            std::vector<uint8_t> copy(bytes, bytes + size);
++            ps2x::iop::IopWorker::deferToEe([this, address, copy = std::move(copy)] {
++                writeGuest(address, copy.data(), copy.size());
++            });
++            return true;
++        }
++        return ps2x::iop::IopWorker::eeCall([&] { return writeGuest(address, source, size); });
++    }
+     if (!source && size != 0)
+     {
+         return false;
+@@ -175,6 +206,15 @@
+ 
+ bool PS2IopHostAdapter::zeroGuest(uint32_t address, size_t size)
+ {
++    if (ps2x::iop::IopWorker::onWorkerThread())
++    {
++        if (deferrableGuestRange(address, size))
++        {
++            ps2x::iop::IopWorker::deferToEe([this, address, size] { zeroGuest(address, size); });
++            return true;
++        }
++        return ps2x::iop::IopWorker::eeCall([&] { return zeroGuest(address, size); });
++    }
+     uint8_t *destination = nullptr;
+     if (!guestRange(address, size, destination))
+     {
+@@ -228,6 +268,8 @@
+ 
+ uint32_t PS2IopHostAdapter::allocateIopHandle(ps2x::iop::IopHandleKind kind)
+ {
++    if (ps2x::iop::IopWorker::onWorkerThread())
++        return ps2x::iop::IopWorker::eeCall([&] { return allocateIopHandle(kind); });
+     uint8_t *const rdram = m_activeRdram
+                                ? m_activeRdram
+                                : m_runtime.memory().getRDRAM();
+@@ -242,11 +284,18 @@
+ 
+ uint32_t PS2IopHostAdapter::allocateGuest(uint32_t size, uint32_t alignment)
+ {
++    if (ps2x::iop::IopWorker::onWorkerThread())
++        return ps2x::iop::IopWorker::eeCall([&] { return allocateGuest(size, alignment); });
+     return m_runtime.guestMalloc(size, alignment);
+ }
+ 
+ void PS2IopHostAdapter::freeGuest(uint32_t address)
+ {
++    if (ps2x::iop::IopWorker::onWorkerThread())
++    {
++        ps2x::iop::IopWorker::deferToEe([this, address] { freeGuest(address); });
++        return;
++    }
+     m_runtime.guestFree(address);
+ }
+ 
+@@ -255,6 +304,11 @@
+                                      ps2x::iop::GuestBuffer send,
+                                      ps2x::iop::GuestBuffer receive)
+ {
++    if (ps2x::iop::IopWorker::onWorkerThread())
++    {
++        ps2x::iop::IopWorker::eeCall([&] { audioCommand(sid, function, send, receive); });
++        return;
++    }
+     uint8_t *sendPointer = nullptr;
+     uint8_t *receivePointer = nullptr;
+     if (send.address && !guestRange(send.address, send.size, sendPointer))
+@@ -430,6 +484,8 @@
+ 
+ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &request)
+ {
++    if (ps2x::iop::IopWorker::onWorkerThread())
++        return ps2x::iop::IopWorker::eeCall([&] { return memoryCard(request); });
+     using Handler = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
+     Handler handler = nullptr;
+     switch (request.operation)
+@@ -513,6 +569,10 @@
+                                             uint32_t a3,
+                                             uint32_t *resultAddress)
+ {
++    if (ps2x::iop::IopWorker::onWorkerThread())
++        return ps2x::iop::IopWorker::eeCall([&] {
++            return invokeGuestFunction(callToken, address, a0, a1, a2, a3, resultAddress);
++        });
+     (void)callToken;
+     (void)address;
+     (void)a0;
+@@ -530,6 +590,17 @@
+                                        const void *packet,
+                                        size_t packetSize)
+ {
++    if (ps2x::iop::IopWorker::onWorkerThread())
++    {
++        // IOP-to-EE command notifications are fire-and-forget; the dispatcher's
++        // result is informational and is not consumed by the IOP.
++        const auto *bytes = static_cast<const uint8_t *>(packet);
++        std::vector<uint8_t> copy(bytes, bytes + (packet ? packetSize : 0u));
++        ps2x::iop::IopWorker::deferToEe([this, commandId, copy = std::move(copy)] {
++            sendSifCommand(commandId, copy.data(), copy.size());
++        });
++        return true;
++    }
+     uint8_t *const rdram = m_activeRdram
+                                ? m_activeRdram
+                                : m_runtime.memory().getRDRAM();
+@@ -555,6 +626,7 @@
+ }
+ 
+ std::vector<uint8_t> PS2IopHostAdapter::saveState() const {
++    m_runtime.quiesceIop();
+     std::lock_guard callLock(m_callMutex);std::lock_guard fileLock(m_hostFileMutex);
+     if(m_activeContext || m_activeRdram || m_activeToken)throw ps2x::state::NotReady("IOP host call is active during snapshot");
+     ps2x::state::Writer ar;ar(m_nextToken,m_nextHostFileHandle,uint64_t(m_hostFiles.size()));
+@@ -562,6 +634,7 @@
+     return std::move(ar.data);
+ }
+ void PS2IopHostAdapter::loadState(std::span<const uint8_t> data) {
++    m_runtime.quiesceIop();
+     std::lock_guard callLock(m_callMutex);std::lock_guard fileLock(m_hostFileMutex);
+     if(m_activeContext || m_activeRdram || m_activeToken)throw ps2x::state::NotReady("IOP host call is active during restore");
+     ps2x::state::Reader ar(data);uint64_t token=0,next=0,count=0;ar(token,next,count);
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -39,6 +39,7 @@
+ namespace ps2x::iop
+ {
+     class IopSubsystem;
++    struct IopExecutionStats;
+ }
+ namespace ps2x::state { class Writer; class Reader; }
+ 
+@@ -317,6 +318,14 @@
+     {m_pauseStateClock=std::move(pause);m_resumeStateClock=std::move(resume);m_excludeStateClock=std::move(exclude);}
+     // Configure before run(); its IOP reset establishes a fresh host epoch.
+     void setRealtimeIopClock(bool enabled) { m_iopClock.setRealtime(enabled); }
++    // Waits for queued IOP worker credit and its EE callbacks; no-op when the worker is off.
++    void quiesceIop() const;
++    // Cumulative IOP cycle accounting by thread. Read it at completed-frame boundaries.
++    [[nodiscard]] ps2x::iop::IopExecutionStats iopExecutionStats() const;
++    // Enables or disables the IOP worker thread. Disabling quiesces and joins it.
++    void setIopWorkerEnabled(bool enabled);
++    // Start hook for the worker thread (for example, core pinning). Set before enabling.
++    void setIopWorkerThreadHook(std::function<void()> hook);
+ 
+     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+diff --git a/ps2xIOP/include/ps2x/iop/iop_worker.h b/ps2xIOP/include/ps2x/iop/iop_worker.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/iop_worker.h
+@@ -0,0 +1,181 @@
++#pragma once
++
++#include <atomic>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <mutex>
++#include <optional>
++#include <thread>
++#include <type_traits>
++#include <utility>
++#include <vector>
++
++namespace ps2x::iop
++{
++    // Runs IOP work on one dedicated host thread. The worker executes, in order:
++    //  * IOP cycle credits, from a single-producer single-consumer ring;
++    //  * jobs the EE thread asks for with runOnWorker (RPCs, module control, SIF
++    //    notifications), which execute IOP code on the worker and let the EE wait;
++    //  * blocking jobs the worker asks for with eeCall, which run on the EE thread;
++    //  * deferred jobs the worker queues with deferToEe, which run on the EE thread.
++    // Ring credit always runs before queued jobs, so EE-visible order equals the
++    // order in which the EE thread submitted work.
++    //
++    // Ownership rule: IOP state is touched by the worker thread. The EE thread touches
++    // it only while the worker is suspended inside a blocking job it requested (an
++    // inline call nested in that job is the inline reentrancy the IOP already has).
++    //
++    // Determinism: drain points depend only on the EE credit stream (quantum
++    // boundaries, ring capacity, and explicit quiesce calls), and EE-side job execution
++    // happens only inside drains and waits, so EE memory a job observes is fixed by
++    // that stream and not by thread timing.
++    class IopWorker
++    {
++    public:
++        using Execute = std::function<void(uint64_t credit)>;
++        using StartHook = std::function<void()>;
++
++        // startHook runs once on the worker thread before the first job.
++        // creditCapacity is rounded up to a power of two.
++        IopWorker(Execute execute, uint64_t quantumCycles, StartHook startHook = StartHook(),
++                  size_t creditCapacity = 4096);
++        ~IopWorker();
++
++        IopWorker(const IopWorker &) = delete;
++        IopWorker &operator=(const IopWorker &) = delete;
++
++        // EE thread only. Queues credit, and may drain at a quantum boundary.
++        void submit(uint64_t credit);
++
++        // EE thread only. Waits until queued credit and jobs have run and EE jobs are
++        // serviced. Returns at once while the worker is suspended in an EE job.
++        void quiesce();
++
++        // EE thread only, not from a serviced job. Quiesces, then joins. Idempotent.
++        void stop();
++
++        // EE thread only. True while the EE thread is running a blocking job the worker
++        // requested. The worker is then suspended on this stack, so IOP work may run inline.
++        [[nodiscard]] bool eeInsideBlockingJob() const noexcept { return m_eeBlockingJobDepth != 0u; }
++
++        [[nodiscard]] static bool onWorkerThread() noexcept { return tlsCurrent != nullptr; }
++
++        // EE thread only. Runs f on the worker thread after all earlier credit and
++        // jobs, and blocks the EE thread until f returns. While it waits, the EE thread
++        // services EE jobs the worker queues, so the worker's blocking calls complete.
++        template <class F, class Result = std::invoke_result_t<F &>>
++        Result runOnWorker(F &&f)
++        {
++            if constexpr (std::is_void_v<Result>)
++            {
++                std::function<void()> job = [&f] { f(); };
++                runOnWorkerJob(job);
++            }
++            else
++            {
++                std::optional<Result> out;
++                std::function<void()> job = [&] { out.emplace(f()); };
++                runOnWorkerJob(job);
++                return std::move(*out);
++            }
++        }
++
++        // Runs f on the EE thread, in FIFO order with other worker jobs, and blocks
++        // the worker until f has completed. Outside the worker thread this calls f directly.
++        template <class F, class Result = std::invoke_result_t<F &>>
++        static Result eeCall(F &&f)
++        {
++            IopWorker *worker = tlsCurrent;
++            if constexpr (std::is_void_v<Result>)
++            {
++                if (!worker)
++                {
++                    f();
++                    return;
++                }
++                std::function<void()> job = [&f] { f(); };
++                worker->postBlocking(job);
++            }
++            else
++            {
++                if (!worker)
++                    return f();
++                std::optional<Result> out;
++                std::function<void()> job = [&] { out.emplace(f()); };
++                worker->postBlocking(job);
++                return std::move(*out);
++            }
++        }
++
++        // Queues f to run on the EE thread at the next drain, in FIFO order, without
++        // blocking the worker. f must own its captured data. Outside the worker thread
++        // this calls f directly.
++        template <class F>
++        static void deferToEe(F &&f)
++        {
++            IopWorker *worker = tlsCurrent;
++            if (!worker)
++            {
++                f();
++                return;
++            }
++            worker->postDeferred(std::function<void()>(std::forward<F>(f)));
++        }
++
++    private:
++        struct EeJob
++        {
++            std::function<void()> fn;
++            bool *done = nullptr; // set for blocking jobs; the worker waits on it
++        };
++        struct WorkerJob
++        {
++            std::function<void()> fn;
++            bool *done = nullptr; // set when the worker has finished the job
++        };
++
++        void run();
++        void runOnWorkerJob(std::function<void()> &job);
++        void postBlocking(std::function<void()> &job);
++        void postDeferred(std::function<void()> job);
++        void runOneEeJobLocked(std::unique_lock<std::mutex> &lock);
++        void drainLocked(std::unique_lock<std::mutex> &lock);
++        void flushOverflowLocked();
++        void publish(uint64_t credit);
++        void wakeWorkerIfSleeping();
++        [[nodiscard]] bool hasRingSpace() const noexcept;
++
++        static thread_local IopWorker *tlsCurrent;
++
++        Execute m_execute;
++        uint64_t m_quantumCycles;
++        size_t m_capacity; // power of two
++        std::vector<uint64_t> m_ring;
++        StartHook m_startHook;
++
++        // EE-thread state (only the EE thread touches these).
++        uint64_t m_cyclesSinceBoundary = 0;
++        uint64_t m_creditsSinceBoundary = 0;
++        std::deque<uint64_t> m_overflow; // credit that did not fit the ring during a nested submit
++        unsigned m_eeBlockingJobDepth = 0u; // blocking jobs the EE thread is running on this stack
++
++        // Shared state.
++        std::atomic<uint64_t> m_tail{0}; // written by the EE thread
++        std::atomic<uint64_t> m_head{0}; // written by the worker thread
++        std::atomic<bool> m_workerSleeping{false};
++        std::atomic<bool> m_eeWaiting{false};
++
++        std::mutex m_mutex; // guards the job queues, the flags below and the condition variables
++        std::condition_variable m_workerCv; // worker waits: sleeping, or a blocking job completion
++        std::condition_variable m_eeCv;     // EE waits: drain condition, a queued EE job, or a worker job
++        std::deque<EeJob> m_eeJobs;
++        std::deque<WorkerJob> m_workerJobs;
++        bool m_workerJobRunning = false;
++        bool m_stop = false;
++
++        std::thread m_thread; // declared last: starts after every member above is constructed
++    };
++}
+diff --git a/ps2xIOP/src/iop_worker.cpp b/ps2xIOP/src/iop_worker.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/src/iop_worker.cpp
+@@ -0,0 +1,300 @@
++#include "ps2x/iop/iop_worker.h"
++
++#include <cstdlib>
++#include <stdexcept>
++
++namespace ps2x::iop
++{
++    thread_local IopWorker *IopWorker::tlsCurrent = nullptr;
++
++    namespace
++    {
++        size_t roundUpToPowerOfTwo(size_t value)
++        {
++            size_t result = 1u;
++            while (result < value)
++                result <<= 1u;
++            return result;
++        }
++    }
++
++    IopWorker::IopWorker(Execute execute, uint64_t quantumCycles, StartHook startHook, size_t creditCapacity)
++        : m_execute(std::move(execute)),
++          m_quantumCycles(quantumCycles ? quantumCycles : 1u),
++          m_capacity(roundUpToPowerOfTwo(creditCapacity < 2u ? 2u : creditCapacity)),
++          m_ring(m_capacity),
++          m_startHook(std::move(startHook)),
++          m_thread(&IopWorker::run, this)
++    {
++    }
++
++    IopWorker::~IopWorker()
++    {
++        try
++        {
++            stop();
++        }
++        catch (...)
++        {
++            // Destruction must not throw, and a joinable thread must not be destroyed.
++            // Reaching here means the object was destroyed from inside a blocking EE job.
++            std::abort();
++        }
++    }
++
++    bool IopWorker::hasRingSpace() const noexcept
++    {
++        return m_tail.load(std::memory_order_relaxed) - m_head.load(std::memory_order_acquire) < m_capacity;
++    }
++
++    void IopWorker::publish(uint64_t credit)
++    {
++        // Only the EE thread writes m_tail, so the relaxed load reads its own value.
++        const uint64_t tail = m_tail.load(std::memory_order_relaxed);
++        m_ring[tail & (m_capacity - 1u)] = credit;
++        m_tail.store(tail + 1u, std::memory_order_seq_cst);
++    }
++
++    void IopWorker::wakeWorkerIfSleeping()
++    {
++        // Pairs with the worker's sleep handshake: it sets m_workerSleeping and then
++        // checks for work under the mutex, so either it sees this credit or we see it sleeping.
++        if (m_workerSleeping.load(std::memory_order_seq_cst))
++        {
++            std::lock_guard lock(m_mutex);
++            m_workerCv.notify_all();
++        }
++    }
++
++    void IopWorker::submit(uint64_t credit)
++    {
++        if (credit == 0u)
++            return;
++        if (m_eeBlockingJobDepth == 0u &&
++            (m_cyclesSinceBoundary >= m_quantumCycles || m_creditsSinceBoundary + 1u >= m_capacity))
++        {
++            // Quantum boundary, or the ring would fill. These depend only on the EE
++            // credit stream. Drain: wait for the worker and service its EE jobs.
++            std::unique_lock lock(m_mutex);
++            drainLocked(lock);
++            m_cyclesSinceBoundary = 0u;
++            m_creditsSinceBoundary = 0u;
++        }
++        m_cyclesSinceBoundary += credit;
++        ++m_creditsSinceBoundary;
++        if (m_overflow.empty() && hasRingSpace())
++        {
++            publish(credit);
++            wakeWorkerIfSleeping();
++            return;
++        }
++        // Reached only from a nested submit while the worker is suspended, where a
++        // drain would deadlock. Keep the credit in FIFO order behind the ring.
++        m_overflow.push_back(credit);
++        std::lock_guard lock(m_mutex);
++        flushOverflowLocked();
++    }
++
++    void IopWorker::flushOverflowLocked()
++    {
++        bool published = false;
++        while (!m_overflow.empty() && hasRingSpace())
++        {
++            publish(m_overflow.front());
++            m_overflow.pop_front();
++            published = true;
++        }
++        if (published && m_workerSleeping.load(std::memory_order_seq_cst))
++            m_workerCv.notify_all();
++    }
++
++    void IopWorker::quiesce()
++    {
++        if (onWorkerThread())
++            return;
++        std::unique_lock lock(m_mutex);
++        drainLocked(lock);
++    }
++
++    void IopWorker::stop()
++    {
++        if (onWorkerThread())
++            throw std::logic_error("IopWorker::stop called from the worker thread");
++        {
++            std::unique_lock lock(m_mutex);
++            if (m_eeBlockingJobDepth != 0u)
++                throw std::logic_error("IopWorker::stop called from a blocking EE job");
++            drainLocked(lock);
++            m_stop = true;
++            m_workerCv.notify_all();
++        }
++        if (m_thread.joinable())
++            m_thread.join();
++    }
++
++    // Runs the first queued EE job. The caller holds the lock; it is released while the job runs.
++    void IopWorker::runOneEeJobLocked(std::unique_lock<std::mutex> &lock)
++    {
++        EeJob job = std::move(m_eeJobs.front());
++        m_eeJobs.pop_front();
++        const bool blocking = job.done != nullptr;
++        if (blocking)
++            ++m_eeBlockingJobDepth;
++        lock.unlock();
++        try
++        {
++            job.fn();
++        }
++        catch (...)
++        {
++            // Callbacks report failure through their return values.
++        }
++        lock.lock();
++        if (blocking)
++        {
++            --m_eeBlockingJobDepth;
++            *job.done = true;
++            m_workerCv.notify_all();
++        }
++    }
++
++    void IopWorker::drainLocked(std::unique_lock<std::mutex> &lock)
++    {
++        // The EE thread is inside a blocking job the worker requested. The worker is suspended
++        // on this stack with IOP state mid-credit, so the caller proceeds inline, as the
++        // inline reentrancy does. Waiting here would deadlock.
++        if (m_eeBlockingJobDepth != 0u)
++            return;
++        for (;;)
++        {
++            if (!m_eeJobs.empty())
++            {
++                runOneEeJobLocked(lock);
++                continue;
++            }
++            flushOverflowLocked();
++            // Announce the wait before the final check, so the worker's post-consume check
++            // cannot miss it (Dekker pattern).
++            m_eeWaiting.store(true, std::memory_order_seq_cst);
++            if (m_overflow.empty() && m_eeJobs.empty() && !m_workerJobRunning &&
++                m_head.load(std::memory_order_seq_cst) == m_tail.load(std::memory_order_relaxed))
++            {
++                m_eeWaiting.store(false, std::memory_order_seq_cst);
++                return;
++            }
++            m_eeCv.wait(lock);
++            m_eeWaiting.store(false, std::memory_order_seq_cst);
++        }
++    }
++
++    void IopWorker::runOnWorkerJob(std::function<void()> &job)
++    {
++        if (onWorkerThread() || m_eeBlockingJobDepth != 0u)
++        {
++            // Already on the worker, or inside a job the worker is suspended on: run inline.
++            job();
++            return;
++        }
++        std::unique_lock lock(m_mutex);
++        bool done = false;
++        m_workerJobs.push_back(WorkerJob{job, &done});
++        m_workerCv.notify_all(); // the worker may be sleeping
++        while (!done)
++        {
++            if (!m_eeJobs.empty())
++            {
++                runOneEeJobLocked(lock);
++                continue;
++            }
++            m_eeCv.wait(lock);
++        }
++    }
++
++    void IopWorker::postBlocking(std::function<void()> &job)
++    {
++        std::unique_lock lock(m_mutex);
++        bool done = false;
++        m_eeJobs.push_back(EeJob{job, &done});
++        m_eeCv.notify_all();
++        m_workerCv.wait(lock, [&done] { return done; });
++    }
++
++    void IopWorker::postDeferred(std::function<void()> job)
++    {
++        std::lock_guard lock(m_mutex);
++        m_eeJobs.push_back(EeJob{std::move(job), nullptr});
++        m_eeCv.notify_all();
++    }
++
++    void IopWorker::run()
++    {
++        tlsCurrent = this;
++        if (m_startHook)
++        {
++            try
++            {
++                m_startHook();
++            }
++            catch (...)
++            {
++                // A failed affinity request leaves the thread where the scheduler put it.
++            }
++        }
++        uint64_t head = 0u;
++        for (;;)
++        {
++            // Ring credit first: IOP credit always precedes jobs queued after it.
++            if (m_tail.load(std::memory_order_seq_cst) != head)
++            {
++                const uint64_t credit = m_ring[head & (m_capacity - 1u)];
++                try
++                {
++                    m_execute(credit);
++                }
++                catch (...)
++                {
++                    // The emulator contains its own errors; keep the queue and handoff alive.
++                }
++                ++head;
++                m_head.store(head, std::memory_order_seq_cst);
++                if (m_eeWaiting.load(std::memory_order_seq_cst))
++                {
++                    std::lock_guard lock(m_mutex);
++                    m_eeCv.notify_all();
++                }
++                continue;
++            }
++
++            std::unique_lock lock(m_mutex);
++            if (!m_workerJobs.empty())
++            {
++                WorkerJob job = std::move(m_workerJobs.front());
++                m_workerJobs.pop_front();
++                m_workerJobRunning = true;
++                lock.unlock();
++                try
++                {
++                    job.fn();
++                }
++                catch (...)
++                {
++                    // Errors inside an RPC are reported through its result.
++                }
++                lock.lock();
++                m_workerJobRunning = false;
++                if (job.done)
++                    *job.done = true;
++                m_eeCv.notify_all();
++                continue;
++            }
++            if (m_stop)
++                break;
++            m_workerSleeping.store(true, std::memory_order_seq_cst);
++            m_workerCv.wait(lock, [this, head] {
++                return m_tail.load(std::memory_order_seq_cst) != head || !m_workerJobs.empty() || m_stop;
++            });
++            m_workerSleeping.store(false, std::memory_order_seq_cst);
++        }
++        tlsCurrent = nullptr;
++    }
++}
+diff --git a/ps2xIOP/include/ps2x/iop/iop_routed_host.h b/ps2xIOP/include/ps2x/iop/iop_routed_host.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/iop_routed_host.h
+@@ -0,0 +1,57 @@
++#pragma once
++
++#include "ps2x/iop/iop_host.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <string_view>
++
++namespace ps2x::iop
++{
++    // Forwards every IopHost call to an inner host. When the call comes from the IOP
++    // worker thread:
++    //  * host file operations (open, size, read, close, path translation), memory
++    //    card and guest-function calls run on the EE thread as blocking jobs, so all
++    //    host file I/O stays on the thread that owns the host filesystem sessions;
++    //  * submitted PCM is copied and handed to the EE thread as a deferred job, since
++    //    the audio sink may write capture files;
++    //  * everything else is forwarded directly. The adapter routes the EE-state
++    //    callbacks it owns (guest memory, SIF dispatch) itself.
++    // On any other thread every call is forwarded directly.
++    class IopEeRoutedHost final : public IopHost
++    {
++    public:
++        explicit IopEeRoutedHost(IopHost &inner) noexcept : m_inner(inner) {}
++
++        bool stopRequested() const noexcept override;
++        bool readGuest(uint32_t address, void *destination, size_t size) const override;
++        bool writeGuest(uint32_t address, const void *source, size_t size) override;
++        bool zeroGuest(uint32_t address, size_t size) override;
++        bool normalizeGuestAddress(uint32_t address, uint32_t &normalized) const override;
++        bool readIopMemory(uint32_t address, void *destination, size_t size) const override;
++        bool writeIopMemory(uint32_t address, const void *source, size_t size) override;
++        bool zeroIopMemory(uint32_t address, size_t size) override;
++        bool normalizeIopAddress(uint32_t address, uint32_t &normalized) const override;
++        uint32_t allocateIopHandle(IopHandleKind kind) override;
++        uint32_t allocateGuest(uint32_t size, uint32_t alignment) override;
++        void freeGuest(uint32_t address) override;
++        void audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive) override;
++        void submitAudioSamples(const int16_t *samples, size_t stereoFrames) override;
++        std::string hostPath(HostPathKind kind) const override;
++        std::string translateGuestPath(std::string_view path) const override;
++        uint64_t openHostFile(std::string_view path) override;
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override;
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size, size_t &bytesRead) override;
++        void closeHostFile(uint64_t handle) override;
++        int32_t memoryCard(const MemoryCardRequest &request) override;
++        bool hasGuestFunction(uint32_t address) const override;
++        bool invokeGuestFunction(uint64_t callToken, uint32_t address, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++                                 uint32_t *resultAddress) override;
++        bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
++        void log(LogLevel level, std::string_view message) override;
++
++    private:
++        IopHost &m_inner;
++    };
++}
+diff --git a/ps2xIOP/src/iop_routed_host.cpp b/ps2xIOP/src/iop_routed_host.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/src/iop_routed_host.cpp
+@@ -0,0 +1,121 @@
++#include "ps2x/iop/iop_routed_host.h"
++
++#include "ps2x/iop/iop_worker.h"
++
++#include <vector>
++
++namespace ps2x::iop
++{
++    bool IopEeRoutedHost::stopRequested() const noexcept { return m_inner.stopRequested(); }
++
++    bool IopEeRoutedHost::readGuest(uint32_t address, void *destination, size_t size) const
++    {
++        return m_inner.readGuest(address, destination, size);
++    }
++
++    bool IopEeRoutedHost::writeGuest(uint32_t address, const void *source, size_t size)
++    {
++        return m_inner.writeGuest(address, source, size);
++    }
++
++    bool IopEeRoutedHost::zeroGuest(uint32_t address, size_t size) { return m_inner.zeroGuest(address, size); }
++
++    bool IopEeRoutedHost::normalizeGuestAddress(uint32_t address, uint32_t &normalized) const
++    {
++        return m_inner.normalizeGuestAddress(address, normalized);
++    }
++
++    bool IopEeRoutedHost::readIopMemory(uint32_t address, void *destination, size_t size) const
++    {
++        return m_inner.readIopMemory(address, destination, size);
++    }
++
++    bool IopEeRoutedHost::writeIopMemory(uint32_t address, const void *source, size_t size)
++    {
++        return m_inner.writeIopMemory(address, source, size);
++    }
++
++    bool IopEeRoutedHost::zeroIopMemory(uint32_t address, size_t size) { return m_inner.zeroIopMemory(address, size); }
++
++    bool IopEeRoutedHost::normalizeIopAddress(uint32_t address, uint32_t &normalized) const
++    {
++        return m_inner.normalizeIopAddress(address, normalized);
++    }
++
++    uint32_t IopEeRoutedHost::allocateIopHandle(IopHandleKind kind) { return m_inner.allocateIopHandle(kind); }
++
++    uint32_t IopEeRoutedHost::allocateGuest(uint32_t size, uint32_t alignment)
++    {
++        return m_inner.allocateGuest(size, alignment);
++    }
++
++    void IopEeRoutedHost::freeGuest(uint32_t address) { m_inner.freeGuest(address); }
++
++    void IopEeRoutedHost::audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive)
++    {
++        m_inner.audioCommand(sid, function, send, receive);
++    }
++
++    void IopEeRoutedHost::submitAudioSamples(const int16_t *samples, size_t stereoFrames)
++    {
++        if (!IopWorker::onWorkerThread() || stereoFrames == 0)
++        {
++            m_inner.submitAudioSamples(samples, stereoFrames);
++            return;
++        }
++        // The sink may write capture files. Copy the frames and deliver them in order on the EE thread.
++        std::vector<int16_t> copy(samples, samples + stereoFrames * 2);
++        IopWorker::deferToEe([inner = &m_inner, copy = std::move(copy)] {
++            inner->submitAudioSamples(copy.data(), copy.size() / 2u);
++        });
++    }
++
++    std::string IopEeRoutedHost::hostPath(HostPathKind kind) const { return m_inner.hostPath(kind); }
++
++    std::string IopEeRoutedHost::translateGuestPath(std::string_view path) const
++    {
++        return IopWorker::eeCall([&] { return m_inner.translateGuestPath(path); });
++    }
++
++    uint64_t IopEeRoutedHost::openHostFile(std::string_view path)
++    {
++        return IopWorker::eeCall([&] { return m_inner.openHostFile(path); });
++    }
++
++    bool IopEeRoutedHost::hostFileSize(uint64_t handle, uint64_t &size) const
++    {
++        return IopWorker::eeCall([&] { return m_inner.hostFileSize(handle, size); });
++    }
++
++    bool IopEeRoutedHost::readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size, size_t &bytesRead)
++    {
++        return IopWorker::eeCall([&] { return m_inner.readHostFile(handle, offset, destination, size, bytesRead); });
++    }
++
++    void IopEeRoutedHost::closeHostFile(uint64_t handle)
++    {
++        IopWorker::eeCall([&] { m_inner.closeHostFile(handle); });
++    }
++
++    int32_t IopEeRoutedHost::memoryCard(const MemoryCardRequest &request)
++    {
++        return IopWorker::eeCall([&] { return m_inner.memoryCard(request); });
++    }
++
++    bool IopEeRoutedHost::hasGuestFunction(uint32_t address) const { return m_inner.hasGuestFunction(address); }
++
++    bool IopEeRoutedHost::invokeGuestFunction(uint64_t callToken, uint32_t address, uint32_t a0, uint32_t a1, uint32_t a2,
++                                              uint32_t a3, uint32_t *resultAddress)
++    {
++        return IopWorker::eeCall([&] {
++            return m_inner.invokeGuestFunction(callToken, address, a0, a1, a2, a3, resultAddress);
++        });
++    }
++
++    bool IopEeRoutedHost::sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize)
++    {
++        return m_inner.sendSifCommand(commandId, packet, packetSize);
++    }
++
++    void IopEeRoutedHost::log(LogLevel level, std::string_view message) { m_inner.log(level, message); }
++}

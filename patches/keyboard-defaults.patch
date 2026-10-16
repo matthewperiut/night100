@@ -1,0 +1,65 @@
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..341946d 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -87,19 +87,19 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         data[4] = static_cast<uint8_t>(128 + rx * 127);
+         data[5] = static_cast<uint8_t>(128 + ry * 127);
+     }
+-    else
++    // Keyboard remains available when a controller is connected.
+     {
+-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
++        if (IsKeyDown(KEY_UP))
+             clearBit(PAD_UP);
+-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
++        if (IsKeyDown(KEY_DOWN))
+             clearBit(PAD_DOWN);
+-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
++        if (IsKeyDown(KEY_LEFT))
+             clearBit(PAD_LEFT);
+-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
++        if (IsKeyDown(KEY_RIGHT))
+             clearBit(PAD_RIGHT);
+         if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+             clearBit(PAD_CROSS);
+-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
++        if (IsKeyDown(KEY_C))
+             clearBit(PAD_CIRCLE);
+         if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+             clearBit(PAD_SQUARE);
+@@ -109,14 +109,31 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             clearBit(PAD_L1);
+         if (IsKeyDown(KEY_E))
+             clearBit(PAD_R1);
+-        if (IsKeyDown(KEY_LEFT_SHIFT))
++        if (IsKeyDown(KEY_ONE))
+             clearBit(PAD_L2);
+-        if (IsKeyDown(KEY_RIGHT_SHIFT))
++        if (IsKeyDown(KEY_THREE))
+             clearBit(PAD_R2);
+         if (IsKeyDown(KEY_ENTER))
+             clearBit(PAD_START);
+-        if (IsKeyDown(KEY_TAB))
++        if (IsKeyDown(KEY_TAB) || IsKeyDown(KEY_RIGHT_SHIFT))
+             clearBit(PAD_SELECT);
++        if (IsKeyDown(KEY_LEFT_CONTROL))
++            clearBit(PAD_L3);
++        if (IsKeyDown(KEY_RIGHT_CONTROL))
++            clearBit(PAD_R3);
++
++        auto keyboardStick = [&data](int offset, int left, int right, int up, int down)
++        {
++            const int x = int(IsKeyDown(right)) - int(IsKeyDown(left));
++            const int y = int(IsKeyDown(down)) - int(IsKeyDown(up));
++            if (x != 0 || y != 0)
++            {
++                data[offset] = x < 0 ? 0 : x > 0 ? 255 : kPadStickCenter;
++                data[offset + 1] = y < 0 ? 0 : y > 0 ? 255 : kPadStickCenter;
++            }
++        };
++        keyboardStick(6, KEY_A, KEY_D, KEY_W, KEY_S);
++        keyboardStick(4, KEY_J, KEY_L, KEY_I, KEY_K);
+     }
+ 
+     data[2] = static_cast<uint8_t>(btns & 0xFF);

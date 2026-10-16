@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="17" viewBox="0 0 16 17">
+  <title>Switch X face button</title>
+  <path fill="#282828" d="M0 0H16V17H0Z"/>
+  <g transform="translate(-1 -2.5)" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5 5L13 17M13 5L5 17"/>
+  </g>
+</svg>

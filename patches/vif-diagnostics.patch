@@ -1,0 +1,46 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index b02c7ca..f1cb73f 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,6 +1,8 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include <cstring>
++#include <cstdio>
++#include <cstdlib>
+ 
+ enum VIFCmd : uint8_t
+ {
+@@ -572,6 +574,18 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ 
+             const bool zeroExtend = (imm & 0x4000u) != 0u;
+ 
++            if (std::getenv("NIGHT100_TRACE_VIF") && (vuAddr >= 1008 || vuAddr + writeVectorCount > 1008)) {
++                static unsigned count = 0;
++                if (count++ < 48) {
++                    std::fprintf(stderr, "[vif-unpack] cmd=%08x addr=%u count=%u bytes=%u available=%u cycle=%x mask=%x mode=%u\n",
++                                 cmd, vuAddr, writeVectorCount, totalBytes, sizeBytes-pos, vif1_regs.cycle, vif1_regs.mask, vif1_regs.mode);
++                    for (uint32_t offset = 0; offset < std::min(totalBytes, 64u) && pos+offset+4 <= sizeBytes; offset += 4) {
++                        uint32_t word; std::memcpy(&word, data+pos+offset, 4);
++                        std::fprintf(stderr, "%08x%c", word, (offset % 16 == 12) ? '\n' : ' ');
++                    }
++                }
++            }
++
+             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+             {
+                 const uint8_t *srcBase = data + pos;
+@@ -710,6 +724,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                         handledFormat = false;
+                     }
+ 
++                    // Hardware replicates V2's X/Y into Z/W, including for
++                    // masked unpacks. RenderWare uses those broadcast lanes.
++                    if (handledFormat && components == 2) {
++                        decompressed[2] = decompressed[0];
++                        decompressed[3] = decompressed[1];
++                    }
++
+                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.
+                     if (!handledFormat && decoded && !maskEnable && (vif1_regs.mode == 0u || vif1_regs.mode == 3u))
+                     {

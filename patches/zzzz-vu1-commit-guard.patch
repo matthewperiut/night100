@@ -1,0 +1,76 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -120,23 +120,6 @@
+     return normalizeOperand(vf[bc & 3u]);
+ }
+ 
+-float VU1Interpreter::normalizeOperand(float value) const
+-{
+-    uint32_t bits = 0;
+-    std::memcpy(&bits, &value, sizeof(bits));
+-    const uint32_t exponent = (bits >> 23) & 0xFFu;
+-    if (exponent == 0u)
+-    {
+-        bits &= 0x80000000u;
+-    }
+-    else if (exponent == 0xFFu)
+-    {
+-        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+-    }
+-    std::memcpy(&value, &bits, sizeof(value));
+-    return value;
+-}
+-
+ float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
+ {
+     uint32_t bits = 0;
+@@ -953,7 +936,11 @@
+     m_state.cycles = m_cycle;
+     // LSU commits become visible at the cycle boundary before PATH1 consumes
+     // its next qword from VU memory.
+-    commitReadyPipelines();
++    // commitReadyPipelines() only reads these pending masks/valid flags; when
++    // none is set it performs no work, so skip the call.
++    if ((m_flagActive | m_efuActive | m_storeActive | m_vfActive |
++         m_viActive | m_accActive) != 0u || m_fdiv.valid)
++        commitReadyPipelines();
+     progressXgkick();
+ }
+ 
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -3,6 +3,7 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <cstring>
+ #include <stdexcept>
+ #include <cstddef>
+ #include <vector>
+@@ -354,7 +355,23 @@
+     void markPairWrites(const DecodedInstructionPair &decoded);
+     bool pipelinesPending() const;
+ 
+-    float normalizeOperand(float value) const;
++    // Pure bit-level helper; defined inline so per-operand calls avoid a call.
++    float normalizeOperand(float value) const
++    {
++        uint32_t bits = 0;
++        std::memcpy(&bits, &value, sizeof(bits));
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        if (exponent == 0u)
++        {
++            bits &= 0x80000000u;
++        }
++        else if (exponent == 0xFFu)
++        {
++            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++        }
++        std::memcpy(&value, &bits, sizeof(value));
++        return value;
++    }
+     float normalizeResult(float value, uint32_t &laneFlags) const;
+     uint32_t microAddressMask() const;
+     int32_t readBranchVi(uint8_t reg) const;

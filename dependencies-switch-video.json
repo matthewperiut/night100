@@ -1,0 +1,14 @@
+{
+  "ffmpeg-nvtegra": {
+    "path": "vendor/ffmpeg-switch",
+    "url": "https://github.com/averne/FFmpeg.git",
+    "commit": "caeec83b791be08ed43468a2ef426d6901d51c78",
+    "branch_hint": "nvtegra",
+    "license": "GPL-2.0-or-later",
+    "role": "Horizon/libnx Tegra X1 NVDEC hardware MPEG-2 decoder; no software playback fallback",
+    "upstream_patches": "The pinned upstream nvtegra backend requires the recorded libnx MMU compatibility patch: request MmuModuleId_Nvdec instead of hardcoded module 5 (Nvenc in libnx 4.12.0).",
+    "patches": [
+      "patches/ffmpeg-switch/nvdec-clock.patch"
+    ]
+  }
+}

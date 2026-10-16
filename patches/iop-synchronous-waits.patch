@@ -1,0 +1,37 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -736,12 +736,32 @@
+         cleanupDeadThreads();
+     }
+
++    IopThread &IopKernel::beginGuestCall()
++    {
++        m_idleUntil = 0;
++        IopThread thread;
++        thread.id = static_cast<int>(m_nextThreadId++);
++        thread.state = IopThreadState::Running;
++        thread.guestCall = true;
++        thread.priority = 1;
++        auto [entry, inserted] = m_threads.emplace(thread.id, std::move(thread));
++        m_currentThread = &entry->second;
++        return entry->second;
++    }
++
++    void IopKernel::endGuestCall(int id, IopThread *previous)
++    {
++        m_idleUntil = 0;
++        m_threads.erase(id);
++        m_currentThread = previous;
++    }
++
+     void IopKernel::cleanupDeadThreads()
+     {
+         m_idleUntil = 0;
+         for (auto thread = m_threads.begin(); thread != m_threads.end();)
+         {
+-            if (thread->second.state != IopThreadState::Dead)
++            if (thread->second.state != IopThreadState::Dead || thread->second.guestCall)
+             {
+                 ++thread;
+                 continue;

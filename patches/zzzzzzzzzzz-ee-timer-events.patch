@@ -1,0 +1,223 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -305,6 +305,9 @@
+ 
+ // One line per program, sorted by execute time descending, prefixed with "[vu1-prog] replay=N".
+ std::vector<std::string> formatVU1ProgramHistogram(const VU1ProgramHistogram &histogram, int replayId);
++
++// NIGHT100_REFERENCE_EE_TIMERS=1 selects the eager reference path. Unset, empty or any other value selects the deferred path.
++bool eeTimerReferenceFromEnvironment() noexcept;
+ 
+ class PS2Memory
+ {
+@@ -343,9 +346,10 @@
+         {
+             m_cachedGifStat=nullptr;
+             // Deferred cycles belong to the replaced timeline.
+-            m_eeTimerPendingCycles=0;
++            m_eeTimerLogicalCycles=0;
++            m_eeTimerAppliedCycles=0;
+             m_eeTimerLatchedInterrupts=0;
+-            m_eeTimerNextEventValid=false;
++            m_eeTimerDeferralLimit=0;
+         }
+         if (!m_rdram || !m_scratchpad || !m_gsVRAM || !iop_ram ||
+             !m_vu0Code || !m_vu0Data || !m_vu1Code || !m_vu1Data)
+@@ -451,7 +455,24 @@
+     // Scheduler checkpoint form of advanceEeTimers. Timer clocks are applied
+     // lazily: the result is identical to advancing at every checkpoint because
+     // every timer register access, state save and cycle query flushes first.
+-    uint32_t accumulateEeTimerCycles(uint64_t eeCycles) noexcept;
++    // Scheduler checkpoint. Deferred timer clocks use one absolute logical clock.
++    // The common case is one compare against m_eeTimerDeferralLimit (the logical time
++    // of the next interrupt, capped by the deferral bound) and one add. Everything else
++    // takes the out-of-line path. A zero limit means "invalid", so the compare fails.
++    uint32_t accumulateEeTimerCycles(uint64_t eeCycles) noexcept
++    {
++        if (eeCycles != 0u && m_eeTimerDeferralLimit > m_eeTimerLogicalCycles &&
++            eeCycles < m_eeTimerDeferralLimit - m_eeTimerLogicalCycles && m_cachedGifStat)
++        {
++            // Same effect as clearGifFqcForCheckpoint, without a store when FQC is already clear.
++            if (*m_cachedGifStat & kGifFqcClearMask)
++                *m_cachedGifStat &= ~kGifFqcClearMask;
++            m_eeTimerLogicalCycles += eeCycles;
++            return m_eeTimerLatchedInterrupts ? takeEeTimerInterrupts() : 0u;
++        }
++        return accumulateEeTimerCyclesSlow(eeCycles);
++    }
++    uint32_t accumulateEeTimerCyclesSlow(uint64_t eeCycles) noexcept;
+     void flushEeTimers() noexcept;
+     [[nodiscard]] uint32_t takeEeTimerInterrupts() noexcept;
+ 
+@@ -612,15 +633,20 @@
+     // references survive insertion/rehash; initialize and state Reader are the
+     // only runtime operations that discard nodes and invalidate this pointer.
+     uint32_t* m_cachedGifStat=nullptr;
+-    // Deferred EE timer clocks. The logical timer time is applied state plus
+-    // m_eeTimerPendingCycles. m_eeTimerCyclesToEvent is the exact distance from
+-    // that logical time to the next interrupt. When m_eeTimerNextEventValid is
+-    // false, pending cycles are zero and the distance must be recomputed.
+-    uint64_t m_eeTimerPendingCycles = 0;
+-    uint64_t m_eeTimerCyclesToEvent = 0;
++    // Deferred EE timer clocks. Logical time advances at every deferred checkpoint.
++    // Timer registers reflect time up to m_eeTimerAppliedCycles. The difference is
++    // pending, and is applied at the next register read, save or configuration change.
++    // m_eeTimerDeferralLimit is an absolute logical time. Deferred checkpoints that keep
++    // logical time below it cannot change an interrupt bit. Zero means invalid, which
++    // is only possible when nothing is pending.
++    uint64_t m_eeTimerLogicalCycles = 0;
++    uint64_t m_eeTimerAppliedCycles = 0;
++    uint64_t m_eeTimerDeferralLimit = 0;
+     uint32_t m_eeTimerLatchedInterrupts = 0;
+-    bool m_eeTimerNextEventValid = false;
+     void clearGifFqcForCheckpoint() noexcept;
++    static constexpr uint32_t kGifFqcClearMask = 0x1F000000u;
++    // Sampled once at construction from NIGHT100_REFERENCE_EE_TIMERS. Default: deferred path.
++    bool m_eeTimerReference = eeTimerReferenceFromEnvironment();
+     uint32_t advanceEeTimerClocks(uint64_t eeCycles) noexcept;
+     [[nodiscard]] uint64_t eeTimerCyclesToEvent() const noexcept;
+ };
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -169,11 +169,6 @@
+         15734ull,
+     };
+ 
+-    // Sample once, outside the very frequent scheduler checkpoint path.
+-    const bool kReferenceEeTimers = [] {
+-        const char *value = std::getenv("NIGHT100_REFERENCE_EE_TIMERS");
+-        return !value || (value[0] == '1' && value[1] == '\0');
+-    }();
+ 
+     template<unsigned Shift>
+     inline uint64_t advanceDividedEeClock(uint64_t cycles, uint64_t &remainder)
+@@ -424,9 +419,10 @@
+ void PS2Memory::resetEeTimers() noexcept
+ {
+     m_eeTimers = {};
+-    m_eeTimerPendingCycles = 0u;
++    m_eeTimerLogicalCycles = 0u;
++    m_eeTimerAppliedCycles = 0u;
+     m_eeTimerLatchedInterrupts = 0u;
+-    m_eeTimerNextEventValid = false;
++    m_eeTimerDeferralLimit = 0u;
+ }
+ 
+ void PS2Memory::clearGifFqcForCheckpoint() noexcept
+@@ -449,24 +445,25 @@
+     {
+         return 0u;
+     }
+-    // Eager form: apply any deferred cycles first, then this checkpoint. The
+-    // logical timer time moves outside the cached distance, so invalidate it.
++    // Eager form: apply pending time, then this checkpoint, and move both clocks together.
+     flushEeTimers();
+-    m_eeTimerNextEventValid = false;
++    m_eeTimerDeferralLimit = 0u;
+     clearGifFqcForCheckpoint();
++    m_eeTimerLogicalCycles += eeCycles;
++    m_eeTimerAppliedCycles = m_eeTimerLogicalCycles;
+     return takeEeTimerInterrupts() | advanceEeTimerClocks(eeCycles);
+ }
+ 
+ void PS2Memory::flushEeTimers() noexcept
+ {
+-    // Deferred cycles were proven to contain no interrupt, so the result is
+-    // always empty here; it is latched anyway and never dropped.
+-    const uint64_t pending = m_eeTimerPendingCycles;
++    // Deferred cycles were proven to contain no interrupt, so the result is always
++    // empty here; it is latched anyway and never dropped.
++    const uint64_t pending = m_eeTimerLogicalCycles - m_eeTimerAppliedCycles;
+     if (pending == 0u)
+     {
+         return;
+     }
+-    m_eeTimerPendingCycles = 0u;
++    m_eeTimerAppliedCycles = m_eeTimerLogicalCycles;
+     m_eeTimerLatchedInterrupts |= advanceEeTimerClocks(pending);
+ }
+ 
+@@ -491,41 +488,48 @@
+     return cyclesUntilNextEeTimerInterrupt();
+ }
+ 
+-uint32_t PS2Memory::accumulateEeTimerCycles(uint64_t eeCycles) noexcept
++bool eeTimerReferenceFromEnvironment() noexcept
+ {
++    const char *value = std::getenv("NIGHT100_REFERENCE_EE_TIMERS");
++    return value && value[0] == '1' && value[1] == '\0';
++}
++
++uint32_t PS2Memory::accumulateEeTimerCyclesSlow(uint64_t eeCycles) noexcept
++{
+     if (eeCycles == 0u)
+     {
+         return 0u;
+     }
+     clearGifFqcForCheckpoint();
+-    if (kReferenceEeTimers)
++    if (m_eeTimerReference)
+     {
+         // The reference oracle advances every checkpoint; nothing is deferred.
+         return advanceEeTimerClocks(eeCycles);
+     }
+-    if (!m_eeTimerNextEventValid)
++    if (m_eeTimerDeferralLimit == 0u)
+     {
+-        m_eeTimerCyclesToEvent = eeTimerCyclesToEvent();
+-        m_eeTimerNextEventValid = true;
++        // Invalid limits exist only when nothing is pending, so timer registers
++        // describe the logical time exactly. Compute the next interrupt from them.
++        constexpr uint64_t kMaxDeferredCycles = uint64_t{1} << 40;
++        const uint64_t distance = eeTimerCyclesToEvent();
++        const uint64_t event = distance == std::numeric_limits<uint64_t>::max()
++                                   ? std::numeric_limits<uint64_t>::max()
++                                   : m_eeTimerLogicalCycles + distance;
++        m_eeTimerDeferralLimit = std::min(event, m_eeTimerAppliedCycles + kMaxDeferredCycles);
+     }
+ 
+-    // Cycles before the first interrupt cannot change any interrupt bit; they
+-    // only move COUNT and the rational phase, which are applied at flush time.
+-    constexpr uint64_t kMaxDeferredCycles = uint64_t{1} << 40;
+-    if (eeCycles < m_eeTimerCyclesToEvent && eeCycles < kMaxDeferredCycles - m_eeTimerPendingCycles)
++    if (m_eeTimerDeferralLimit > m_eeTimerLogicalCycles && eeCycles < m_eeTimerDeferralLimit - m_eeTimerLogicalCycles)
+     {
+-        m_eeTimerPendingCycles += eeCycles;
+-        if (m_eeTimerCyclesToEvent != std::numeric_limits<uint64_t>::max())
+-        {
+-            m_eeTimerCyclesToEvent -= eeCycles;
+-        }
++        m_eeTimerLogicalCycles += eeCycles;
+         return takeEeTimerInterrupts();
+     }
+ 
+     // An interrupt is due, or the deferral bound was reached. Apply the older
+     // cycles, then this checkpoint, exactly as two sequential advances.
+     flushEeTimers();
+-    m_eeTimerNextEventValid = false;
++    m_eeTimerLogicalCycles += eeCycles;
++    m_eeTimerAppliedCycles = m_eeTimerLogicalCycles;
++    m_eeTimerDeferralLimit = 0u;
+     return takeEeTimerInterrupts() | advanceEeTimerClocks(eeCycles);
+ }
+ 
+@@ -547,7 +551,7 @@
+ 
+         const unsigned clock = timer.mode & kEeTimerModeClksMask;
+         uint64_t ticks;
+-        if (!kReferenceEeTimers && clock < 3u && timer.clockRemainder < kEeClockHz)
++        if (!m_eeTimerReference && clock < 3u && timer.clockRemainder < kEeClockHz)
+         {
+             switch (clock)
+             {
+@@ -1275,7 +1279,7 @@
+     {
+         // Apply deferred cycles under the old configuration before any change.
+         flushEeTimers();
+-        m_eeTimerNextEventValid = false;
++        m_eeTimerDeferralLimit = 0u;
+         EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {

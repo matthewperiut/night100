@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""Reproduce the Scooby USA native macOS bring-up from a locally owned disc."""
+import argparse
+import bisect
+import csv
+import contextlib
+import fcntl
+import hashlib
+import json
+import math
+import os
+import platform
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent
+os.chdir(ROOT)
+LOGS = ROOT / 'logs'
+LOGS.mkdir(exist_ok=True)
+ELF_SHA = 'd5febfa97119fba2c2f3eb58abaae268037afae2773ddc57cab7e1c813b485b1'
+
+
+def run(args, log=None, timeout=None):
+    print('+ ' + ' '.join(map(str, args)), flush=True)
+    if log:
+        with (LOGS / log).open('w') as stream:
+            try:
+                subprocess.run(args, check=True, stdout=stream, stderr=subprocess.STDOUT, timeout=timeout)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                print((LOGS / log).read_text(errors='replace')[-10000:], file=sys.stderr)
+                raise
+    else:
+        subprocess.run(args, check=True, timeout=timeout)
+
+
+def compiler_cache_args():
+    """Share object compilations across build directories when ccache is installed."""
+    launcher = shutil.which('ccache')
+    if not launcher:
+        return []
+    return [f'-DCMAKE_C_COMPILER_LAUNCHER={launcher}', f'-DCMAKE_CXX_COMPILER_LAUNCHER={launcher}']
+
+
+def verified_chain(chain):
+    """True when the checkout equals its pinned commit plus every patch in order.
+
+    Replays the chain on a scratch export of the pinned commit and compares the
+    result with the live worktree. A fully patched tree therefore needs no
+    patch-by-patch reverse checks, which fail once later patches share context.
+    """
+    import filecmp, tempfile
+    pin = subprocess.check_output(['git', '-C', 'vendor/PS2Recomp', 'rev-parse', 'HEAD'], text=True).strip()
+    with tempfile.TemporaryDirectory(prefix='ps2-chain-') as scratch:
+        archive = subprocess.run(['git', '-C', 'vendor/PS2Recomp', 'archive', pin], capture_output=True)
+        if archive.returncode:return False
+        subprocess.run(['tar', '-x', '-C', scratch], input=archive.stdout, check=True)
+        for patch_path in chain:
+            if subprocess.run(['git', 'apply', str(patch_path.resolve())], cwd=scratch, capture_output=True).returncode:
+                return False
+        diff = subprocess.run(['diff', '-rq', '-x', '.git', scratch, 'vendor/PS2Recomp'], capture_output=True)
+        return diff.returncode == 0
+
+
+def bootstrap():
+    for command in ('git', 'cmake', 'ninja', '7zz', 'pkg-config', 'clang++'):
+        if not shutil.which(command):
+            raise SystemExit(f'Missing {command}. Install prerequisites: brew install cmake ninja sevenzip ffmpeg pkgconf')
+    deps = json.loads(Path('dependencies.json').read_text())
+    for name, dep in deps.items():
+        path = Path(dep['path'])
+        if not path.exists():
+            run(['git', 'clone', '--no-checkout', '--depth', '1', dep['url'], str(path)], 'fetch-' + name + '.log')
+            run(['git', '-C', str(path), 'fetch', '--depth', '1', 'origin', dep['commit']], 'fetch-' + name + '.log')
+            run(['git', '-C', str(path), 'checkout', '--detach', dep['commit']])
+        actual = subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
+        if actual != dep['commit']:
+            raise SystemExit(f'{path}: expected pinned revision {dep["commit"]}, found {actual}')
+    # Patches overlap by context, so a per-patch reverse check fails once later
+    # patches are applied. A marker in the checkout's git dir records the verified
+    # digest of the whole chain (pristine pin + sorted patches); it is not in the worktree.
+    chain = sorted(Path('patches').glob('*.patch'))
+    digest = hashlib.sha256(b''.join(p.read_bytes() for p in chain)).hexdigest()
+    marker = Path('vendor/PS2Recomp') / subprocess.check_output(
+        ['git', '-C', 'vendor/PS2Recomp', 'rev-parse', '--git-path', 'night100-patch-state'], text=True).strip()
+    if not (marker.exists() and marker.read_text().strip() == digest):
+        if not verified_chain(chain):
+            for patch_path in chain:
+                patch = str(patch_path.resolve())
+                check = subprocess.run(['git', '-C', 'vendor/PS2Recomp', 'apply', '--reverse', '--check', patch], capture_output=True)
+                if check.returncode:
+                    run(['git', '-C', 'vendor/PS2Recomp', 'apply', '--check', patch])
+                    run(['git', '-C', 'vendor/PS2Recomp', 'apply', patch])
+        marker.write_text(digest + '\n')
+    run(['cmake', '-S', 'vendor/PS2Recomp', '-B', 'build/toolchain', '-G', 'Ninja',
+         '-DCMAKE_BUILD_TYPE=Release', '-DPS2X_BUILD_RUNTIME=OFF', '-DPS2X_BUILD_STUDIO=OFF',
+         '-DPS2X_BUILD_TEST=OFF'], 'configure-toolchain.log')
+    run(['cmake', '--build', 'build/toolchain', '--target', 'ps2_analyzer', 'ps2_recomp', '-j', '8'], 'build-toolchain.log')
+
+
+def prepare(iso):
+    if not Path('build/toolchain/ps2xAnalyzer/ps2_analyzer').exists():
+        bootstrap()
+    if not iso:
+        images = list(ROOT.glob('*.iso'))
+        if len(images) != 1:
+            raise SystemExit('Pass the local disc image using --iso PATH')
+        iso = images[0]
+    iso = Path(iso).resolve()
+    # Skip FMVs and padding: gameplay files take ~793 MiB instead of duplicating the disc.
+    run(['7zz', 'x', '-y', '-ogame', str(iso), 'SLUS_203.49', 'SYSTEM.CNF', 'SD2.INI',
+         'IOPRP243.IMG', 'MODULES/*', '*.HIP', 'FMV/THQLOGO.PSS', 'FMV/HILOGO.PSS',
+         'FMV/WBLOGO.PSS', 'FMV/RW4.PSS', 'FMV/INTRO.PSS', '-r'], 'extract.log')
+    digest = hashlib.sha256(Path('game/SLUS_203.49').read_bytes()).hexdigest()
+    if digest != ELF_SHA:
+        raise SystemExit(f'Unsupported ELF SHA256: {digest}')
+    run([sys.executable, 'tools/disc.py', str(iso)], 'disc.log')
+    run([sys.executable, 'tools/dwarf1.py', 'game/SLUS_203.49'], 'dwarf.log')
+    run(['build/toolchain/ps2xAnalyzer/ps2_analyzer', 'game/SLUS_203.49', 'analysis/analyzer.toml'], 'analyzer.log')
+    recompile()
+
+
+def recompile():
+    run([sys.executable, 'tools/prepare_config.py'])
+    stage = Path('build/generated-stage')
+    if stage.exists():
+        for file in stage.glob('*'):
+            if file.is_file():
+                file.unlink()
+    run(['build/toolchain/ps2xRecomp/ps2_recomp', 'analysis/scooby.toml'], 'recompile.log')
+    # Upstream can return success even when its report contains instruction errors.
+    report = (LOGS / 'recompile.log').read_text()
+    if '[error]' in report:
+        raise SystemExit('Recompiler reported errors; see logs/recompile.log')
+    run([sys.executable, 'tools/sync_generated.py'])
+    Path('generated/.night100-codegen.json').write_text(json.dumps(codegen_fingerprint(), sort_keys=True)+'\n')
+
+
+def codegen_fingerprint():
+    paths = ['build/toolchain/ps2xRecomp/ps2_recomp', 'analysis/scooby.toml',
+             'analysis/functions.json', 'tools/prepare_config.py', 'tools/sync_generated.py', 'game/SLUS_203.49']
+    return {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in paths}
+
+
+@contextlib.contextmanager
+def build_lock():
+    # A second launcher waits for the current build, rather than running two
+    # Ninja/code-generation processes in the same output tree.
+    with (LOGS / '.build.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def switch_devkit():
+    # switch.specs consumes this during linking as well as CMake configuration.
+    devkit = Path(os.environ.get('DEVKITPRO', '/opt/devkitpro')).resolve()
+    if not (devkit / 'cmake/Switch.cmake').is_file():
+        raise SystemExit('Install devkitPro switch-dev, switch-zlib and switch-libpng first; see the README')
+    os.environ['DEVKITPRO'] = str(devkit)
+    os.environ['DEVKITA64'] = str(devkit / 'devkitA64')
+    return devkit
+
+
+def build_gpu_probe():
+    with build_lock():
+        bootstrap()
+        switch_devkit()
+        run(['cmake', '-S', 'platform/switch', '-B', 'build/switch-gpu-probe', '-G', 'Ninja',
+             f'-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/switch/toolchain.cmake', '-DCMAKE_BUILD_TYPE=Release',
+             '-DNIGHT100_GPU_PROBE_ONLY=ON', '-DNIGHT100_DEKO_VALIDATION=ON'], 'configure-switch-probe.log')
+        run(['cmake', '--build', 'build/switch-gpu-probe', '--target', 'night100_gpu_probe_nro', '-j', '8'], 'build-switch-probe.log')
+
+
+def build(platform_name='mac'):
+    with build_lock():
+        bootstrap()
+        if not Path('game/SLUS_203.49').exists():
+            raise SystemExit('Run ./night100 prepare first to extract and configure the local disc')
+        stamp=Path('generated/.night100-codegen.json')
+        if not stamp.exists() or json.loads(stamp.read_text()) != codegen_fingerprint():
+            print('Recompiler or configuration changed; regenerating game code.', flush=True)
+            recompile()
+        run([sys.executable, 'tools/controller_assets.py', '--game', 'game', '--output', 'controllers'], 'controller-assets.log')
+        if platform_name == 'switch':
+            devkit = switch_devkit()
+            run([sys.executable, 'tools/bootstrap_switch_video.py', '--devkitpro', str(devkit)], 'switch-video-build.log')
+            run(['cmake', '-S', 'platform/switch', '-B', 'build/switch', '-G', 'Ninja',
+                 f'-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/switch/toolchain.cmake',
+                 '-DCMAKE_BUILD_TYPE=Release',
+                 '-DNIGHT100_DEKO_VALIDATION=' + ('ON' if args.gpu_validation else 'OFF')] + compiler_cache_args(), 'configure-switch.log')
+            run(['cmake', '--build', 'build/switch', '--target', 'night100_nro', '-j', '8'], 'build-switch.log')
+            return
+        run(['cmake', '-S', '.', '-B', 'build/mac', '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+             f'-DFETCHCONTENT_BASE_DIR={ROOT}/build/toolchain/_deps'] + compiler_cache_args(), 'configure-mac.log')
+        run(['cmake', '--build', 'build/mac', '--target', 'night100', '-j', '8'], 'build-mac.log')
+
+
+def symbol(value):
+    address = int(value, 0)
+    funcs = json.loads(Path('analysis/functions.json').read_text())
+    matches = [f for f in funcs if f['start'] <= address < f['end']]
+    if matches:
+        for f in matches:
+            print(f'{f["name"]}+0x{address-f["start"]:x} [{f["start"]:#x}, {f["end"]:#x}) {f["source"]}')
+    else:
+        for f in csv.DictReader(Path('analysis/combined.csv').open()):
+            if int(f['start'], 0) <= address < int(f['end'], 0):
+                print(f'{f["name"]} [{f["start"]}, {f["end"]}) (heuristic SDK range)')
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('action', choices=['bootstrap', 'prepare', 'recompile', 'build', 'package', 'deploy', 'run', 'test', 'graphics-test', 'graphics-benchmark', 'gameplay-benchmark', 'smoke', 'all', 'symbol'])
+parser.add_argument('--platform', choices=['mac', 'switch'], default='mac', help='Build/package target; defaults to the existing desktop path')
+parser.add_argument('--gpu-validation', action='store_true', help='Switch: enable deko3d driver validation for graphics diagnosis')
+parser.add_argument('--resources', type=Path, help='Switch: reuse a verified compact resource folder (otherwise extract the ISO once)')
+parser.add_argument('--host', help='Switch remote host; token is read privately from SWITCH_TOKEN or ~/.config/switch-dev/token')
+parser.add_argument('--assets', choices=['none', 'bootstrap', 'all'], default='none', help='Switch deployment: executable only by default, bootstrap or all assets on first install')
+parser.add_argument('--assets-only', action='store_true', help='Switch deployment: transfer assets without launching')
+parser.add_argument('--gpu-self-test', action='store_true', help='Switch: run bounded GPU fixtures before loading any original assets')
+parser.add_argument('--cpu-profile', action='store_true', help='Switch: sample CPU work on one game frame in 60')
+parser.add_argument('--native-cpu-profile', action='store_true', help='Switch: collect a bounded native CPU profile during controllable gameplay')
+parser.add_argument('--cpu-kernel-benchmark', action='store_true', help='Switch: compare original/native animation kernels before game startup')
+parser.add_argument('--resource-cache', choices=['off', 'file', 'prefetch'], help='Switch: cache disc reads in RAM (file: whole files on first touch, 512 MiB cap; prefetch: also loads every manifest file, 1 GiB cap). Default off')
+parser.add_argument('--iop-worker', action='store_true', help='Switch: accepted for older command lines; the IOP worker on core 2 is already the default')
+parser.add_argument('--reference-particles', action='store_true', help='Switch: select the reference particle path (setter pending in src/native_particles.h)')
+parser.add_argument('--render-image', choices=['off', 'rendermat', 'image'], help='Switch: decoupled-render stage (rendermat: player matrix at end of update; image: single-threaded render image, needs a NIGHT100_DIRTY_LINES=ON build). Default off')
+parser.add_argument('--no-iop-worker', action='store_true', help='Switch: opt out of the IOP worker thread on core 2 (default on)')
+parser.add_argument('--aspect', choices=['4:3', '16:9'], default='16:9', help='Switch: 16:9 (default) widens the gameplay world to the full display while 2D stays in the centered 4:3 area; 4:3 keeps the original layout')
+parser.add_argument('--internal-res', choices=['auto', 'half', '1x', '2x'], default='auto', help='Switch internal resolution: auto (handheld 1x, docked 2x), half, 1x or 2x (1280x720); L+R+X cycles at runtime')
+parser.add_argument('--switch-clocks', choices=['fast', 'default'], help='Switch: fast (default) requests CPU 1785/GPU 921 (768 fallback)/EMC 1600 MHz while focused (homebrew-only); default leaves clocks alone')
+parser.add_argument('address', nargs='?')
+parser.add_argument('--iso', type=Path)
+parser.add_argument('--seconds', type=float, default=20)
+parser.add_argument('--skip-videos', action='store_true', help='Skip FMVs while testing the game renderer')
+parser.add_argument('--metrics', action='store_true', help='Show completed-game FPS and CPU/GPU time; F3 toggles it')
+parser.add_argument('--skip-intro', action='store_true', help='Benchmark only: press Cross when the game allows skipping its intro')
+parser.add_argument('--debug-manor', action='store_true', help='Benchmark only: warp to the manor, unlock its gate and press Circle')
+parser.add_argument('--debug-bats', action='store_true', help='Benchmark only: enter the manor, collect its key and walk through the bat hallway')
+parser.add_argument('--no-frame-captures', action='store_true', help='Benchmark only: disable periodic diagnostic image exports')
+parser.add_argument('--no-gpu-timing', action='store_true', help='Benchmark only: disable GPU timing queries for CPU measurements')
+parser.add_argument('--benchmark-binary', type=Path, help='Benchmark only: run a preserved executable for controlled before/after comparisons')
+parser.add_argument('--debug-snack', action='store_true', help='Benchmark only: warp onto a walking route through an original Scooby snack')
+input_mode = parser.add_mutually_exclusive_group()
+input_mode.add_argument('--record-inputs', type=Path, help='Record keyboard/controller input from a fresh launch')
+input_mode.add_argument('--replay-inputs', type=Path, help='Replay a recorded input session from a fresh launch')
+input_mode.add_argument('--replay-session', type=int, help='Restore a numbered full-state capture and replay its inputs')
+parser.add_argument('--replay-continue', action='store_true', help='Return control to you when replay ends; otherwise stop and save diagnostics')
+parser.add_argument('--capture', type=Path, help='Save a screenshot during a smoke run')
+parser.add_argument('--dump-state', type=Path, help='Save EE/VU/GS memory and VU registers for diagnosis')
+parser.add_argument('--renderer', choices=['cpu', 'gl33'], default='gl33')
+parser.add_argument('--graphics', choices=['native', 'gs'], default='native', help='Native GPU engine path (default), or original GS pipeline for comparisons')
+parser.add_argument('--controller-prompts', choices=['ps', 'sw'], help='Button artwork; defaults to the platform profile and leaves controls unchanged')
+parser.add_argument('--record-gs', type=Path, help='Record a local GS command stream for deterministic renderer comparisons')
+parser.add_argument('--replay-gs', type=Path, help='Also replay a recorded GS stream during graphics-test')
+parser.add_argument('--output', type=Path, help='Package destination (default: out/night100), or gameplay benchmark evidence directory')
+parser.add_argument('--cpu-scale', type=float, default=1, help='Optional executor CPU slowdown proxy (10 = 10%% CPU time)')
+parser.add_argument('--gpu-scale', type=float, default=39, help='GPU timing multiplier for budget estimates; does not throttle hardware')
+args = parser.parse_args()
+if (args.cpu_profile or args.native_cpu_profile or args.cpu_kernel_benchmark) and args.platform != 'switch':
+    parser.error('CPU profiling options require --platform switch')
+if (args.iop_worker or args.no_iop_worker) and args.platform != 'switch':
+    parser.error('IOP worker options require --platform switch')
+if args.iop_worker and args.no_iop_worker:
+    parser.error('--iop-worker and --no-iop-worker are mutually exclusive')
+if args.switch_clocks and args.platform != 'switch':
+    parser.error('--switch-clocks requires --platform switch')
+if args.aspect != '16:9' and args.platform != 'switch':
+    parser.error('--aspect requires --platform switch')
+
+
+def runtime_args():
+    result = [str(ROOT / 'build/mac/night100'), str(ROOT / 'game/SLUS_203.49')]
+    if args.benchmark_binary:
+        if args.action != 'gameplay-benchmark':
+            raise SystemExit('--benchmark-binary requires gameplay-benchmark')
+        binary=args.benchmark_binary.resolve()
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise SystemExit(f'Benchmark binary is not executable: {binary}')
+        result[0]=str(binary)
+    result += ['--renderer', args.renderer]
+    result += ['--graphics', args.graphics]
+    if args.controller_prompts:
+        result += ['--controller-prompts', args.controller_prompts]
+    if args.cpu_scale != 1:
+        result += ['--cpu-scale', str(args.cpu_scale)]
+    if args.record_gs:
+        args.record_gs.resolve().parent.mkdir(parents=True, exist_ok=True)
+        result += ['--record-gs', str(args.record_gs.resolve())]
+    iso = args.iso
+    if not iso and Path('analysis/disc.json').exists():
+        iso = Path(json.loads(Path('analysis/disc.json').read_text())['iso'])
+    if iso:
+        result += ['--iso', str(iso.resolve())]
+    if args.skip_videos:
+        result += ['--skip-videos']
+    if args.metrics:
+        result += ['--metrics']
+    if args.record_inputs:
+        result += ['--record-inputs', str(args.record_inputs.resolve())]
+    if args.replay_inputs:
+        result += ['--replay-inputs', str(args.replay_inputs.resolve())]
+    if args.replay_session is not None:
+        if args.replay_session<1:
+            raise SystemExit('Replay session number must be positive')
+        replay_root=Path(os.environ.get('NIGHT100_REPLAY_DIRECTORY',ROOT/'logs'/'replays'))
+        result += ['--replay-session',str((replay_root/f'session-{args.replay_session:06d}').resolve())]
+    if args.replay_continue:
+        result += ['--replay-continue']
+    if args.dump_state:
+        result += ['--dump-state', str(args.dump_state.resolve())]
+    if args.record_inputs:
+        recording=args.record_inputs.resolve()
+        recording.parent.mkdir(parents=True, exist_ok=True)
+        if recording.exists() or Path(str(recording)+'.json').exists():
+            raise SystemExit(f'Input recording or launch manifest already exists: {recording}. '
+                             'Choose a new recording filename to preserve the previous attempt.')
+        metadata={'command':result, 'host':platform.platform(),
+                  'binary_sha256':hashlib.sha256(Path(result[0]).read_bytes()).hexdigest(),
+                  'elf_sha256':hashlib.sha256(Path(result[1]).read_bytes()).hexdigest(),
+                  'git_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                  'source_hashes':{str(p):hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in sorted([Path('night100'),Path('CMakeLists.txt'),
+                          *Path('src').rglob('*.cpp'),*Path('src').rglob('*.h'),
+                          Path('controllers/prompts.map'),*Path('controllers/sw').glob('*'),
+                          *Path('shaders').glob('*'),*Path('patches').glob('*.patch')]) if p.is_file()}}
+        with Path(str(recording)+'.json').open('x') as manifest:
+            json.dump(metadata,manifest,indent=2);manifest.write('\n')
+    return result
+
+
+def launch_game():
+    command = runtime_args()
+    try:
+        run(command)
+    finally:
+        # Startup can fail before the runtime opens the recording. Keep its
+        # provenance, but release the name so that the same command can retry.
+        if args.record_inputs and not args.record_inputs.resolve().exists():
+            manifest = Path(str(args.record_inputs.resolve()) + '.json')
+            if manifest.exists():
+                directory = LOGS / 'input-runs'
+                directory.mkdir(parents=True, exist_ok=True)
+                descriptor, archived = tempfile.mkstemp(prefix='failed-launch-', suffix='.json', dir=directory)
+                os.close(descriptor)
+                shutil.move(manifest, archived)
+                print(f'No input recording was created. Launch metadata saved to {archived}; '
+                      'you can retry the same recording filename.', file=sys.stderr)
+
+
+def package_desktop():
+    output = (args.output or Path('out/night100')).absolute()
+    if output.exists() or output.is_symlink():
+        raise SystemExit(f'Choose a new --output folder; already exists: {output}')
+    iso = args.iso
+    if iso is None:
+        images = sorted(ROOT.glob('*.iso'))
+        if len(images) != 1:
+            raise SystemExit('Pass the local disc image using --iso PATH')
+        iso = images[0]
+    iso = iso.resolve()
+    if not Path('game/SLUS_203.49').is_file() or not Path('analysis/functions.json').is_file():
+        prepare(iso)
+    build()
+    run([sys.executable, 'tools/package_release.py', '--iso', str(iso),
+         '--binary', str(ROOT/'build/mac/night100'), '--output', str(output)])
+
+try:
+    if args.action == 'bootstrap': bootstrap()
+    elif args.action == 'prepare': prepare(args.iso)
+    elif args.action == 'recompile':
+        with build_lock():
+            bootstrap()
+            recompile()
+    elif args.action == 'build': build(args.platform)
+    elif args.action == 'deploy' or (args.action == 'run' and args.platform == 'switch'):
+        if args.platform != 'switch':
+            raise SystemExit('Remote deployment requires --platform switch')
+        build('switch')
+        command = [sys.executable, 'tools/switch_deploy.py', '--binary', str(ROOT/'build/switch/night100.nro'),
+                   '--assets', args.assets, '--seconds', str(args.seconds)]
+        if args.host: command += ['--host', args.host]
+        if args.assets_only: command += ['--assets-only']
+        if args.action == 'run' and not args.assets_only: command += ['--launch']
+        if args.output: command += ['--output', str(args.output)]
+        if args.skip_videos: command += ['--skip-videos']
+        if args.gpu_self_test: command += ['--gpu-self-test']
+        if args.cpu_profile: command += ['--cpu-profile']
+        if args.native_cpu_profile: command += ['--native-cpu-profile']
+        if args.cpu_kernel_benchmark: command += ['--cpu-kernel-benchmark']
+        if args.switch_clocks: command += ['--switch-clocks', args.switch_clocks]
+        if args.internal_res: command += ['--internal-res', args.internal_res]
+        if args.platform == 'switch': command += ['--aspect', args.aspect]
+        if args.no_iop_worker: command += ['--no-iop-worker']
+        if args.reference_particles: command += ['--reference-particles']
+        if args.resource_cache: command += ['--resource-cache', args.resource_cache]
+        if args.render_image: command += ['--render-image', args.render_image]
+        if args.replay_session is not None: command += ['--replay-session',str(args.replay_session)]
+        run(command)
+    elif args.action == 'package':
+        if args.platform == 'switch':
+            if not Path('game/SLUS_203.49').is_file() or not Path('analysis/functions.json').is_file():
+                prepare(args.iso)
+            build('switch')
+            resources = (args.resources or ROOT/'out/switch-resources').absolute()
+            if not (resources/'resource-manifest.json').is_file():
+                if args.resources:
+                    raise SystemExit(f'No resource-manifest.json in --resources {resources}')
+                images = [args.iso] if args.iso else sorted(ROOT.glob('*.iso'))
+                if len(images) != 1:
+                    raise SystemExit('Pass the local disc image using --iso PATH')
+                run([sys.executable, 'tools/package_resources.py', '--iso', str(images[0].resolve()), '--output', str(resources)])
+            run([sys.executable, 'tools/package_switch.py', '--resources', str(resources),
+                 '--output', str((args.output or ROOT/'out/switch/night100').absolute())])
+        else:
+            package_desktop()
+    elif args.action == 'all':
+        bootstrap()
+        prepare(args.iso)
+        build(args.platform)
+        run([sys.executable, 'tools/check_analysis.py'])
+        if args.platform == 'mac':
+            run(['build/mac/night100', '--self-test'], 'self-test.log', timeout=30)
+    elif args.action == 'test':
+        build()
+        run([sys.executable, 'tools/check_analysis.py'])
+        run(['build/mac/night100', '--self-test'], 'self-test.log', timeout=30)
+        print((LOGS / 'self-test.log').read_text())
+        run(['cmake', '--build', 'build/mac', '--target', 'controller_prompts_checks', 'movie_audio_checks', 'resource_aliases_checks', 'switch_pcm_converter_checks', 'resource_disc_checks', 'cpu_work_profile_checks', 'switch_cpu_sampler_checks', 'switch_stall_watchdog_checks', 'switch_lifecycle_checks', 'switch_replay_controls_checks', 'switch_replay_storage_checks', 'switch_replay_catalog_checks', 'switch_video_policy_checks', 'replay_catalog_checks', 'replay_harness_input_checks', 'replay_clock_checks', 'frame_telemetry_checks', 'session_ui_checks', 'savestate_core_checks', 'savestate_iop_checks', 'savestate_io_checks', 'savestate_hle_checks', 'graphics_snapshot_checks', 'native_cpu_checks', 'native_particles_checks', 'ee_timers_checks', 'ee_float_environment_checks', 'ee_integer_float_checks', 'fpu_comparison_checks', 'native_im3d_checks', 'native_vu1_checks', 'native_ground_checks', 'iop_worker_checks', 'resource_cache_checks', 'iop_heap_checks', 'audio_pcm_checks',
+             'spu2_checks', 'spu2_differential_checks', 'iop_clock_checks', 'iop_idle_checks', 'iop_wait_checks', 'surface_conversion_checks', 'presentation_lease_checks', 'shared_presentation_checks', 'runtime_failure_checks', 'cd_timing_checks', 'guest_dispatch_checks', 'input_replay_checks', 'runtime_checks', '-j', '8'], 'checks-build.log')
+        run(['ctest', '--test-dir', 'build/mac', '-R',
+             '^(controller_prompts_checks|movie_audio_checks|resource_aliases_checks|switch_pcm_converter_checks|resource_disc_checks|cpu_work_profile_checks|switch_cpu_sampler_checks|switch_stall_watchdog_checks|switch_lifecycle_checks|switch_replay_controls_checks|switch_replay_storage_checks|switch_replay_catalog_checks|switch_video_policy_checks|replay_catalog_checks|replay_harness_input_checks|replay_clock_checks|frame_telemetry_checks|session_ui_checks|savestate_core_checks|savestate_iop_checks|savestate_io_checks|savestate_hle_checks|graphics_snapshot_checks|native_cpu_checks|native_particles_checks|ee_timers_checks|ee_timers_reference_checks|ee_float_environment_checks|ee_integer_float_checks|fpu_comparison_checks|native_im3d_checks|native_vu1_checks|native_ground_checks|iop_worker_checks|resource_cache_checks|iop_heap_checks|audio_pcm_checks|spu2_checks|spu2_differential_checks|iop_clock_checks|iop_idle_checks|iop_wait_checks|surface_conversion_checks|presentation_lease_checks|shared_presentation_checks|runtime_failure_checks|cd_timing_checks|guest_dispatch_checks|input_replay_checks)$', '--output-on-failure'])
+        run(['build/mac/runtime_checks'], 'runtime-checks.log', timeout=30)
+        run([sys.executable, 'tests/phmadh_translation.py'])
+        run([sys.executable, 'tests/gameplay_report.py'])
+        run([sys.executable, 'tests/replay_report.py'])
+        run([sys.executable, 'tests/profile_cpu.py'])
+        run([sys.executable, 'tests/profile_switch_cpu.py'])
+        run([sys.executable, 'tests/compare_replays.py'])
+        run([sys.executable, 'tests/controller_assets.py'])
+        run([sys.executable, 'tests/attract_videos.py'])
+        run([sys.executable, 'tests/package_resources.py'])
+        run([sys.executable, 'tests/bundle_macos.py'])
+        run([sys.executable, 'tests/switch_package.py'])
+        run([sys.executable, 'tests/switch_deploy.py'])
+        run([sys.executable, 'tests/switch_video_bootstrap.py'])
+    elif args.action == 'graphics-test' and args.platform == 'switch':
+        if args.replay_gs:
+            raise SystemExit('Switch graphics-test runs GPU fixtures; recorded GS replay currently uses the desktop renderer')
+        build_gpu_probe()
+        command = [sys.executable, 'tools/switch_deploy.py', '--binary', str(ROOT/'build/switch-gpu-probe/night100-gpu-probe.nro'),
+                   '--root', '/switch/night100-gpu-probe', '--launch', '--gpu-self-test']
+        if args.host: command += ['--host', args.host]
+        if args.output: command += ['--output', str(args.output)]
+        run(command)
+    elif args.action == 'graphics-test':
+        build()
+        run(['cmake', '--build', 'build/mac', '--target', 'graphics_parity', 'graphics_replay', '-j', '8'], 'graphics-build.log')
+        run(['build/mac/graphics_parity'], 'graphics-parity.log', timeout=180)
+        print((LOGS / 'graphics-parity.log').read_text())
+        if args.replay_gs:
+            run(['build/mac/graphics_replay', str(args.replay_gs.resolve()), str(LOGS / 'graphics-replay')], 'graphics-replay.log', timeout=300)
+            print((LOGS / 'graphics-replay/report.json').read_text())
+            run([sys.executable, 'tests/graphics/trace_validation.py', 'build/mac/graphics_replay', str(args.replay_gs.resolve())])
+            run([sys.executable, 'tools/graphics_evidence.py', str(args.replay_gs.resolve()), str(LOGS / 'graphics-replay')])
+    elif args.action == 'graphics-benchmark':
+        if not args.replay_gs:
+            raise SystemExit('Pass a recorded GS workload with --replay-gs PATH')
+        build()
+        run(['cmake', '--build', 'build/mac', '--target', 'graphics_benchmark', '-j', '8'], 'graphics-benchmark-build.log')
+        run(['build/mac/graphics_benchmark', str(args.replay_gs.resolve())], 'graphics-benchmark.log', timeout=180)
+        print((LOGS / 'graphics-benchmark.log').read_text())
+    elif args.action == 'gameplay-benchmark':
+        if args.debug_bats:
+            args.debug_manor = True
+        if args.debug_manor and args.debug_snack:
+            raise SystemExit('Choose one diagnostic scenario: --debug-manor or --debug-snack')
+        if (args.debug_manor or args.debug_snack) and (args.record_inputs or args.replay_inputs):
+            raise SystemExit('Record ordinary inputs without --debug-manor/--debug-snack; diagnostic warps are not controller actions')
+        build()
+        if (not 1 <= args.cpu_scale <= 100 or not math.isfinite(args.gpu_scale) or args.gpu_scale <= 0
+                or not math.isfinite(args.seconds) or args.seconds <= 0):
+            raise SystemExit('CPU scale must be 1..100; GPU scale and seconds must be finite and positive')
+        output = (args.output or Path('logs/gameplay-benchmark')).resolve()
+        if output.exists() and any(output.iterdir()):
+            raise SystemExit(f'Choose an empty --output directory to preserve evidence: {output}')
+        output.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env.update(NIGHT100_BENCHMARK=str(output), NIGHT100_AUTOPLAY='1', NIGHT100_GPU_TIMING='1',
+                   NIGHT100_CPU_SCALE=str(args.cpu_scale))
+        if args.no_frame_captures:
+            env['NIGHT100_BENCHMARK_NO_CAPTURES']='1'
+        if args.no_gpu_timing:
+            env.pop('NIGHT100_GPU_TIMING', None)
+        if args.skip_intro:
+            env['NIGHT100_AUTOPLAY_SKIP_INTRO']='1'
+        if args.debug_manor:
+            env['NIGHT100_BENCHMARK_MANOR']='1'
+        if args.debug_bats:
+            env['NIGHT100_BENCHMARK_BATS']='1'
+        if args.debug_snack:
+            env['NIGHT100_BENCHMARK_SNACK']='1'
+        command = runtime_args() + ['--seconds', str(args.seconds)]
+        if args.capture:
+            args.capture.resolve().parent.mkdir(parents=True, exist_ok=True)
+            command += ['--capture', str(args.capture.resolve()), '--capture-after', str(max(1, args.seconds-2))]
+        manifest = {'command': command, 'host': platform.platform(), 'host_cpu_count': os.cpu_count(),
+                    'render_environment': {key: env.get(key) for key in
+                        ('NIGHT100_REFERENCE_NATIVE_RTT', 'NIGHT100_REFERENCE_UNIFORMS',
+                         'NIGHT100_DISABLE_GPU_PRESENTATION', 'NIGHT100_REFERENCE_CPU')},
+                    'binary_sha256': hashlib.sha256(Path(command[0]).read_bytes()).hexdigest(),
+                    'elf_sha256': hashlib.sha256(Path(command[1]).read_bytes()).hexdigest(),
+                    'cpu_scale': args.cpu_scale, 'gpu_scale': args.gpu_scale,
+                    'disk_cache': 'uncontrolled; do not label as a cold-storage benchmark',
+                    'skip_videos': args.skip_videos,
+                    'skip_intro_with_controller': args.skip_intro,
+                    'debug_manor_warp_unlock': args.debug_manor,
+                    'debug_bats_key_and_hallway': args.debug_bats,
+                    'periodic_frame_captures': not args.no_frame_captures,
+                    'gpu_timing_queries': not args.no_gpu_timing,
+                    'preserved_benchmark_binary': bool(args.benchmark_binary),
+                    'debug_snack_collision': args.debug_snack,
+                    'git_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                    'git_status': subprocess.check_output(['git', 'status', '--short'], text=True)}
+        (output / 'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+        with (output / 'boot.log').open('w') as stream:
+            result = subprocess.run(command, env=env, stdout=stream, stderr=subprocess.STDOUT, timeout=args.seconds+30)
+        run([sys.executable, 'tools/gameplay_report.py', str(output), '--cpu-scale', str(args.cpu_scale),
+             '--gpu-scale', str(args.gpu_scale), '--duration', str(args.seconds), '--exit-code', str(result.returncode)])
+    elif args.action == 'smoke':
+        build()
+        command = runtime_args() + ['--seconds', str(args.seconds)]
+        if args.capture:
+            args.capture.resolve().parent.mkdir(parents=True, exist_ok=True)
+            command += ['--capture', str(args.capture.resolve()), '--capture-after', str(max(1, args.seconds-2))]
+        run(command, 'boot.log', timeout=args.seconds + 30)
+        print((LOGS / 'boot.log').read_text()[-2500:])
+    elif args.action == 'run':
+        build()
+        launch_game()
+    elif args.action == 'symbol': symbol(args.address)
+except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+    raise SystemExit(f'Command failed: {error}. Logs: {LOGS}')

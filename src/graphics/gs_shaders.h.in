@@ -1,0 +1,10 @@
+#pragma once
+inline constexpr const char* gsVertexShader=R"GLSL(@GS_VERTEX_SHADER@)GLSL";
+inline constexpr const char* gsFragmentShader=R"GLSL(@GS_FRAGMENT_SHADER@)GLSL";
+inline constexpr const char* nativeVertexShader=R"GLSL(@NATIVE_VERTEX_SHADER@)GLSL";
+inline constexpr const char* nativeScreenShader=R"GLSL(@NATIVE_SCREEN_SHADER@)GLSL";
+inline constexpr const char* nativeFragmentShader=R"GLSL(@NATIVE_FRAGMENT_SHADER@)GLSL";
+inline constexpr const char* nativeSeedShader=R"GLSL(@NATIVE_SEED_SHADER@)GLSL";
+inline constexpr const char* nativeResolveShader=R"GLSL(@NATIVE_RESOLVE_SHADER@)GLSL";
+inline constexpr const char* completedPresentShader=R"GLSL(@COMPLETED_PRESENT_SHADER@)GLSL";
+inline constexpr const char* nativeRenderTextureShader=R"GLSL(@NATIVE_RENDER_TEXTURE_SHADER@)GLSL";

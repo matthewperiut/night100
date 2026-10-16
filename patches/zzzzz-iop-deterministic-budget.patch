@@ -1,0 +1,23 @@
+--- a/ps2xIOP/include/ps2x/iop/iop_clock.h
++++ b/ps2xIOP/include/ps2x/iop/iop_clock.h
+@@ -112,8 +112,18 @@
+             const uint64_t now=monotonicNanoseconds();
+             const uint64_t sinceEpoch=!m_paused && now>=m_epoch?now-m_epoch:0;
+             uint64_t elapsed=sinceEpoch>UINT64_MAX-m_elapsedOffset?UINT64_MAX:sinceEpoch+m_elapsedOffset;
+-            ar(m_realtime,elapsed,m_deadline);
+-            if constexpr(Archive::loading){m_epoch=now;m_elapsedOffset=elapsed;}
++            // The clock mode is chosen by the host runtime, not by guest state.
++            // Keep the configured mode on load so a deterministic run is not
++            // silently switched back to realtime by a realtime snapshot. A mode
++            // change starts from zero debt: realtime deadlines have no meaning
++            // for the deterministic budget, and deterministic elapsed time was
++            // never converted into device debt.
++            bool archivedRealtime=m_realtime;
++            ar(archivedRealtime,elapsed,m_deadline);
++            if constexpr(Archive::loading){
++                if(archivedRealtime!=m_realtime){elapsed=0;m_deadline=0;}
++                m_epoch=now;m_elapsedOffset=elapsed;
++            }
+         }
+         void pause()
+         {

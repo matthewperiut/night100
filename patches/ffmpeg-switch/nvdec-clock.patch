@@ -1,0 +1,11 @@
+--- a/libavutil/hwcontext_nvtegra.c
++++ b/libavutil/hwcontext_nvtegra.c
+@@ -229,7 +229,7 @@
+      * will be reset when the console goes to sleep.
+      */
+     if (hwctx->nvdec_version) {
+-        err = AVERROR(mmuRequestInitialize(&hwctx->nvdec_channel.mmu_request, (MmuModuleId)5, 8, false));
++        err = AVERROR(mmuRequestInitialize(&hwctx->nvdec_channel.mmu_request, MmuModuleId_Nvdec, 8, false));
+         if (err < 0)
+             goto fail;
+     }

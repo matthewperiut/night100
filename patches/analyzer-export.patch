@@ -1,0 +1,31 @@
+diff --git a/ps2xAnalyzer/src/analyzer_main.cpp b/ps2xAnalyzer/src/analyzer_main.cpp
+index feb1630..d85ae07 100644
+--- a/ps2xAnalyzer/src/analyzer_main.cpp
++++ b/ps2xAnalyzer/src/analyzer_main.cpp
+@@ -1,6 +1,9 @@
+ #include "ps2recomp/elf_analyzer.h"
+ #include <iostream>
+ #include <string>
++#include <fstream>
++#include <iomanip>
++#include "ps2recomp/types.h"
+ 
+ void printUsage()
+ {
+@@ -58,6 +61,16 @@ int main(int argc, char *argv[])
+             return 1;
+         }
+ 
++        // Keep the SDK scanner's function boundaries available to game projects.
++        std::ofstream map(tomlPath + ".csv");
++        map << "name,start,end,size\n";
++        for (const auto &function : analyzer.getFunctions())
++        {
++            map << function.name << ",0x" << std::hex << function.start
++                << ",0x" << function.end << ',' << std::dec
++                << (function.end - function.start) << '\n';
++        }
++
+         std::cout << "\nAnalysis complete\n";
+         std::cout << "TOML configuration has been written to: " << tomlPath << "\n";
+         std::cout << "\nYou can now use this configuration with PS2Recomp:\n";

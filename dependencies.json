@@ -1,0 +1,6 @@
+{
+  "PS2Recomp": {"path": "vendor/PS2Recomp", "url": "https://github.com/ran-j/PS2Recomp.git", "commit": "eb8688b2fd191129f103a39543002c005b33409c", "license": "GPL-3.0"},
+  "dwarfdb": {"path": "reference/dwarfdb", "url": "https://github.com/seilc/dwarfdb.git", "commit": "e2d17e85a31e3178a95f8f1001862dee7ab9d214", "role": "Reference only; original source structure and types"},
+  "bfbb": {"path": "reference/bfbb", "url": "https://github.com/bfbbdecomp/bfbb.git", "commit": "8fb1c232addcacf44932c10c4cede41b43f98f40", "license": "CC0-1.0", "role": "Reference only; related Heavy Iron engine implementation"},
+  "librw": {"path": "vendor/librw", "url": "https://github.com/aap/librw.git", "commit": "18532c2e13efbc1aa43f0b00b4459831f9414de0", "license": "MIT", "role": "Reference only; evaluated as future native RenderWare backend"}
+}

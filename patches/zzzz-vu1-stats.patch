@@ -1,0 +1,190 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index fe0b44a..1ccf36d 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -11,6 +11,7 @@
+ #include <iostream>
+ #include <mutex>
+ #include <stdexcept>
++#include <string>
+ 
+ #include "gs/ps2_gif_arbiter.h"
+ #if defined(_MSC_VER)
+@@ -259,6 +260,25 @@ struct JumpTable
+     std::vector<uint32_t> targets; // Jump targets
+ };
+ 
++// Cumulative VU1 microcode counters for diagnostics. Written only from the
++// VIF1 and MSCAL path, which runs on the EE executor thread; read between frames.
++struct VU1MicrocodeStats
++{
++    uint64_t mpgPackets = 0;       // VIF MPG packets processed
++    uint64_t mpgBytes = 0;         // microcode bytes carried by MPG packets (clamped to VU1 code memory)
++    uint64_t mpgUnchanged = 0;     // MPG packets whose bytes already matched VU1 code memory
++    uint64_t mscalCalls = 0;       // VIF MSCAL/MSCALF starts
++    uint64_t mscntCalls = 0;       // VIF MSCNT starts
++    uint64_t imageHashes = 0;      // code-image hashes computed (code generation changed since the last MSCAL)
++    uint64_t distinctImages = 0;   // distinct code-image hashes recorded
++    uint64_t distinctOverflow = 0; // images that could not be recorded because the hash table was full
++    uint64_t vu1Cycles = 0;        // VU1 cycles reported by MSCAL executions
++    uint64_t vu1ExecNs = 0;        // host nanoseconds spent inside MSCAL microprogram execution
++};
++
++// One-line summary of cumulative counters; diff two snapshots for per-frame values.
++std::string formatVU1MicrocodeStats(const VU1MicrocodeStats &stats);
++
+ class PS2Memory
+ {
+ public:
+@@ -332,6 +352,20 @@ public:
+     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
+     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
+     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
++    const VU1MicrocodeStats &vu1MicrocodeStats() const { return m_vu1Stats; }
++    void recordVU1MpgPacket(uint32_t bytes, bool unchanged)
++    {
++        ++m_vu1Stats.mpgPackets;
++        m_vu1Stats.mpgBytes += bytes;
++        m_vu1Stats.mpgUnchanged += unchanged ? 1u : 0u;
++    }
++    void recordVU1Mscnt() { ++m_vu1Stats.mscntCalls; }
++    void recordVU1Mscal(); // counts the start and hashes the image if its generation changed
++    void recordVU1Execution(uint64_t cycles, uint64_t ns)
++    {
++        m_vu1Stats.vu1Cycles += cycles;
++        m_vu1Stats.vu1ExecNs += ns;
++    }
+ 
+     // Read/write memory
+     uint8_t read8(uint32_t address);
+@@ -426,6 +460,10 @@ public:
+     std::atomic<uint64_t> m_vifWriteCount{0};
+     std::atomic<uint64_t> m_vu0CodeGeneration{0};
+     std::atomic<uint64_t> m_vu1CodeGeneration{0};
++    VU1MicrocodeStats m_vu1Stats;
++    uint64_t m_vu1StatsHashedGeneration = ~0ull;
++    static constexpr uint32_t kVU1ImageTableSize = 1024; // power of two
++    std::array<uint64_t, kVU1ImageTableSize> m_vu1ImageTable{}; // 0 marks an empty slot
+     // I/O registers
+     std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 2768552..0892857 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2585,3 +2585,62 @@ void PS2Memory::clearModifiedFlag(uint32_t address, uint32_t size)
+         }
+     }
+ }
++
++std::string formatVU1MicrocodeStats(const VU1MicrocodeStats &stats)
++{
++    char text[512];
++    std::snprintf(text, sizeof(text),
++                  "vu1 mpg=%llu mpg_bytes=%llu mpg_unchanged=%llu mscal=%llu mscnt=%llu "
++                  "image_hashes=%llu distinct_images=%llu distinct_overflow=%llu "
++                  "vu1_cycles=%llu vu1_exec_us=%.1f",
++                  static_cast<unsigned long long>(stats.mpgPackets),
++                  static_cast<unsigned long long>(stats.mpgBytes),
++                  static_cast<unsigned long long>(stats.mpgUnchanged),
++                  static_cast<unsigned long long>(stats.mscalCalls),
++                  static_cast<unsigned long long>(stats.mscntCalls),
++                  static_cast<unsigned long long>(stats.imageHashes),
++                  static_cast<unsigned long long>(stats.distinctImages),
++                  static_cast<unsigned long long>(stats.distinctOverflow),
++                  static_cast<unsigned long long>(stats.vu1Cycles),
++                  static_cast<double>(stats.vu1ExecNs) / 1000.0);
++    return text;
++}
++
++void PS2Memory::recordVU1Mscal()
++{
++    ++m_vu1Stats.mscalCalls;
++    const uint64_t generation = getVU1CodeGeneration();
++    if (generation == m_vu1StatsHashedGeneration || !m_vu1Code)
++        return;
++    m_vu1StatsHashedGeneration = generation;
++    ++m_vu1Stats.imageHashes;
++
++    // Word-wise FNV-style hash over the whole 16KB micro memory, then a final mix.
++    uint64_t hash = 14695981039346656037ull;
++    for (uint32_t offset = 0; offset < PS2_VU1_CODE_SIZE; offset += 8)
++    {
++        uint64_t word = 0;
++        std::memcpy(&word, m_vu1Code + offset, sizeof(word));
++        hash = (hash ^ word) * 1099511628211ull;
++    }
++    hash ^= hash >> 31;
++    hash *= 0x9E3779B97F4A7C15ull;
++    hash ^= hash >> 29;
++    if (hash == 0)
++        hash = 1;
++
++    const uint32_t mask = kVU1ImageTableSize - 1u;
++    for (uint32_t probe = 0; probe < kVU1ImageTableSize; ++probe)
++    {
++        uint64_t &slot = m_vu1ImageTable[(static_cast<uint32_t>(hash) + probe) & mask];
++        if (slot == hash)
++            return;
++        if (slot == 0)
++        {
++            slot = hash;
++            ++m_vu1Stats.distinctImages;
++            return;
++        }
++    }
++    ++m_vu1Stats.distinctOverflow;
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 3fcfc15..627900d 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -729,9 +729,17 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     // The interpreter's cycle count is cumulative across executes, so record the delta.
++                                     const uint64_t cyclesBefore = m_vu1.state().cycles;
++                                     const auto execStart = std::chrono::steady_clock::now();
+                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                    m_gs, &m_memory, startPC, top, itop, 65536);
++                                     m_memory.recordVU1Execution(
++                                         m_vu1.state().cycles - cyclesBefore,
++                                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                                   std::chrono::steady_clock::now() - execStart)
++                                                                   .count()));
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index fd90477..04be456 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -418,6 +418,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
++            recordVU1Mscal();
+             if (m_vu1MscalCallback)
+                 m_vu1MscalCallback(startPC, runTop, runItop);
+             continue;
+@@ -436,6 +437,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
++            recordVU1Mscnt();
+             if (m_vu1MscntCallback)
+                 m_vu1MscntCallback(runTop, runItop);
+             continue;
+@@ -480,7 +482,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 {
+                     // Identical microcode decodes identically, so re-uploading it
+                     // must not invalidate the VU1 decode cache.
+-                    if (std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) != 0)
++                    const bool unchanged = std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) == 0;
++                    recordVU1MpgPacket(copyBytes, unchanged);
++                    if (!unchanged)
+                     {
+                         std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                         markVU1CodeModified();

@@ -1,0 +1,41 @@
+diff --git a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+index a2bcb77..fc789f3 100644
+--- a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+@@ -400,21 +400,21 @@ namespace ps2recomp
+
+     std::string CodeGenerator::translatePHMADH(const Instruction &inst)
+     {
+-        // Parallel Horizontal Multiply Add Halfword -> results to HI/LO and rd
+-        return fmt::format("{{ __m128i evens = _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,0,2,0)); \n" // Select even halfwords
+-                           "   __m128i odds  = _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,3,1)); \n" // Select odd halfwords
+-                           "   __m128i prod_ev = _mm_mullo_epi16(evens, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,0,2,0))); \n"
+-                           "   __m128i prod_od = _mm_mullo_epi16(odds,  _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,3,1))); \n"
+-                           "   __m128i sum_pairs = _mm_add_epi16(prod_ev, prod_od); \n"                            // Add rs[0]*rt[0] + rs[1]*rt[1], etc.
+-                           "   int32_t h0 = _mm_extract_epi16(sum_pairs, 0) + _mm_extract_epi16(sum_pairs, 1); \n" // Horizontal add within low 32b
+-                           "   int32_t h1 = _mm_extract_epi16(sum_pairs, 2) + _mm_extract_epi16(sum_pairs, 3); \n" // Horizontal add within next 32b
+-                           "   int32_t h2 = _mm_extract_epi16(sum_pairs, 4) + _mm_extract_epi16(sum_pairs, 5); \n"
+-                           "   int32_t h3 = _mm_extract_epi16(sum_pairs, 6) + _mm_extract_epi16(sum_pairs, 7); \n"
+-                           "   int64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
+-                           "   acc += (int64_t)h0 + (int64_t)h1 + (int64_t)h2 + (int64_t)h3; \n"
+-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
+-                           "   SET_GPR_U64(ctx, {}, acc); }}",
+-                           inst.rs, inst.rt, inst.rs, inst.rt, inst.rd);
++        // Four signed adjacent-halfword dot products, modulo 2^32. PHMADH
++        // overwrites rather than accumulates. Each HI/LO doubleword contains
++        // the pair sum below the odd product; HI1/LO1 hold the upper halves.
++        // See PCSX2's EE MMI interpreter, _PHMADH_LO/_PHMADH_HI.
++        return fmt::format("{{ const __m128i rs = GPR_VEC(ctx, {}), rt = GPR_VEC(ctx, {}); \n"
++                           "   const __m128i sums = _mm_madd_epi16(rs, rt); \n"
++                           "   const __m128i odd = _mm_mullo_epi32(_mm_srai_epi32(rs, 16), _mm_srai_epi32(rt, 16)); \n"
++                           "   uint32_t sumWords[4], oddWords[4]; \n"
++                           "   _mm_storeu_si128(reinterpret_cast<__m128i*>(sumWords), sums); \n"
++                           "   _mm_storeu_si128(reinterpret_cast<__m128i*>(oddWords), odd); \n"
++                           "   ctx->lo = uint64_t(sumWords[0]) | (uint64_t(oddWords[0]) << 32); \n"
++                           "   ctx->hi = uint64_t(sumWords[1]) | (uint64_t(oddWords[1]) << 32); \n"
++                           "   ctx->lo1 = uint64_t(sumWords[2]) | (uint64_t(oddWords[2]) << 32); \n"
++                           "   ctx->hi1 = uint64_t(sumWords[3]) | (uint64_t(oddWords[3]) << 32); \n"
++                           "   SET_GPR_VEC(ctx, {}, sums); }}",inst.rs,inst.rt,inst.rd);
+     }
+
+

@@ -1,0 +1,12 @@
+*.iso
+.DS_Store
+__pycache__/
+build/
+out/
+logs/
+game/
+analysis/
+generated/
+vendor/
+reference/
+/controllers/ps/

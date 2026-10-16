@@ -1,0 +1,237 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 1ccf36d..15b98af 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -274,11 +274,38 @@ struct VU1MicrocodeStats
+     uint64_t distinctOverflow = 0; // images that could not be recorded because the hash table was full
+     uint64_t vu1Cycles = 0;        // VU1 cycles reported by MSCAL executions
+     uint64_t vu1ExecNs = 0;        // host nanoseconds spent inside MSCAL microprogram execution
++    uint64_t xgkickStarts = 0;     // XGKICK transfers started by VU1 microprograms
++    uint64_t eeVu1DataReads = 0;   // EE reads that hit VU1 data memory
+ };
+ 
+ // One-line summary of cumulative counters; diff two snapshots for per-frame values.
+ std::string formatVU1MicrocodeStats(const VU1MicrocodeStats &stats);
+ 
++// Per-program VU1 histogram keyed by MSCAL start address (bytes into VU1 code memory).
++// Programs beyond kMaxPrograms accumulate in `other`. Only array updates on the MSCAL path.
++struct VU1ProgramHistogram
++{
++    static constexpr uint32_t kMaxPrograms = 64;
++    struct Entry
++    {
++        uint32_t pc = 0;
++        uint64_t calls = 0;        // MSCAL/MSCALF starts
++        uint64_t execNs = 0;       // host nanoseconds spent executing the program
++        uint64_t xgkickStarts = 0; // XGKICK transfers the program started
++        uint64_t eeReads = 0;      // EE reads of VU1 data memory after this program last returned
++    };
++    std::array<Entry, kMaxPrograms> entries{};
++    Entry other{};
++    uint32_t count = 0;   // used entries in `entries`
++    uint32_t lastSlot = 0; // cache of the most recently matched entry
++
++    Entry &slot(uint32_t index) { return index < kMaxPrograms ? entries[index] : other; }
++    const Entry &slot(uint32_t index) const { return index < kMaxPrograms ? entries[index] : other; }
++};
++
++// One line per program, sorted by execute time descending, prefixed with "[vu1-prog] replay=N".
++std::vector<std::string> formatVU1ProgramHistogram(const VU1ProgramHistogram &histogram, int replayId);
++
+ class PS2Memory
+ {
+ public:
+@@ -360,11 +387,28 @@ public:
+         m_vu1Stats.mpgUnchanged += unchanged ? 1u : 0u;
+     }
+     void recordVU1Mscnt() { ++m_vu1Stats.mscntCalls; }
+-    void recordVU1Mscal(); // counts the start and hashes the image if its generation changed
++    const VU1ProgramHistogram &vu1ProgramHistogram() const { return m_vu1Programs; }
++    // Counts the start for the program at startPC and hashes the image if its generation changed.
++    void recordVU1Mscal(uint32_t startPC);
+     void recordVU1Execution(uint64_t cycles, uint64_t ns)
+     {
+         m_vu1Stats.vu1Cycles += cycles;
+         m_vu1Stats.vu1ExecNs += ns;
++        if (m_vu1ActiveSlot != kVU1NoSlot)
++        {
++            VU1ProgramHistogram::Entry &entry = m_vu1Programs.slot(m_vu1ActiveSlot);
++            entry.execNs += ns;
++            entry.xgkickStarts += m_vu1Stats.xgkickStarts - m_vu1XgkickBase;
++            m_vu1LastSlot = m_vu1ActiveSlot;
++            m_vu1ActiveSlot = kVU1NoSlot;
++        }
++    }
++    void recordVU1Xgkick() { ++m_vu1Stats.xgkickStarts; }
++    void recordVU1EeRead()
++    {
++        ++m_vu1Stats.eeVu1DataReads;
++        if (m_vu1LastSlot != kVU1NoSlot)
++            ++m_vu1Programs.slot(m_vu1LastSlot).eeReads;
+     }
+ 
+     // Read/write memory
+@@ -464,6 +508,12 @@ public:
+     uint64_t m_vu1StatsHashedGeneration = ~0ull;
+     static constexpr uint32_t kVU1ImageTableSize = 1024; // power of two
+     std::array<uint64_t, kVU1ImageTableSize> m_vu1ImageTable{}; // 0 marks an empty slot
++    static constexpr uint32_t kVU1NoSlot = 0xFFFFFFFFu;
++    VU1ProgramHistogram m_vu1Programs;
++    uint32_t m_vu1ActiveSlot = kVU1NoSlot; // program whose MSCAL execution is in flight
++    uint32_t m_vu1LastSlot = kVU1NoSlot;   // program that most recently returned
++    uint64_t m_vu1XgkickBase = 0;          // xgkickStarts when the active program started
++    uint32_t selectVU1ProgramSlot(uint32_t startPC);
+     // I/O registers
+     std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 0892857..01b6e30 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -730,6 +730,8 @@ uint8_t PS2Memory::read8(uint32_t address)
+     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint8_t), vuOffset, vuLimit))
+     {
+         (void)vuLimit;
++        if (vuMem == m_vu1Data)
++            recordVU1EeRead();
+         return vuMem[vuOffset];
+     }
+     else if (isIoRegister(physAddr))
+@@ -765,6 +767,8 @@ uint16_t PS2Memory::read16(uint32_t address)
+     uint32_t vuLimit = 0;
+     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
+     {
++        if (vuMem == m_vu1Data)
++            recordVU1EeRead();
+         return loadScalar<uint16_t>(vuMem, vuOffset, vuLimit, "read16 vu", address);
+     }
+     else if (isIoRegister(physAddr))
+@@ -816,6 +820,8 @@ uint32_t PS2Memory::read32(uint32_t address)
+     uint32_t vuLimit = 0;
+     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
+     {
++        if (vuMem == m_vu1Data)
++            recordVU1EeRead();
+         return loadScalar<uint32_t>(vuMem, vuOffset, vuLimit, "read32 vu", address);
+     }
+     else if (isIoRegister(physAddr))
+@@ -859,6 +865,8 @@ uint64_t PS2Memory::read64(uint32_t address)
+     uint32_t vuLimit = 0;
+     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
+     {
++        if (vuMem == m_vu1Data)
++            recordVU1EeRead();
+         return loadScalar<uint64_t>(vuMem, vuOffset, vuLimit, "read64 vu", address);
+     }
+ 
+@@ -898,6 +906,8 @@ __m128i PS2Memory::read128(uint32_t address)
+     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(__m128i), vuOffset, vuLimit))
+     {
+         inRange(vuOffset, sizeof(__m128i), vuLimit, "read128 vu", address);
++        if (vuMem == m_vu1Data)
++            recordVU1EeRead();
+         return _mm_loadu_si128(reinterpret_cast<const __m128i *>(vuMem + vuOffset));
+     }
+ 
+@@ -2606,9 +2616,35 @@ std::string formatVU1MicrocodeStats(const VU1MicrocodeStats &stats)
+     return text;
+ }
+ 
+-void PS2Memory::recordVU1Mscal()
++uint32_t PS2Memory::selectVU1ProgramSlot(uint32_t startPC)
++{
++    VU1ProgramHistogram &histogram = m_vu1Programs;
++    if (histogram.lastSlot < histogram.count && histogram.entries[histogram.lastSlot].pc == startPC)
++        return histogram.lastSlot;
++    for (uint32_t i = 0; i < histogram.count; ++i)
++    {
++        if (histogram.entries[i].pc == startPC)
++        {
++            histogram.lastSlot = i;
++            return i;
++        }
++    }
++    if (histogram.count < VU1ProgramHistogram::kMaxPrograms)
++    {
++        const uint32_t index = histogram.count++;
++        histogram.entries[index].pc = startPC;
++        histogram.lastSlot = index;
++        return index;
++    }
++    return VU1ProgramHistogram::kMaxPrograms; // table full: accumulate in `other`
++}
++
++void PS2Memory::recordVU1Mscal(uint32_t startPC)
+ {
+     ++m_vu1Stats.mscalCalls;
++    m_vu1ActiveSlot = selectVU1ProgramSlot(startPC);
++    ++m_vu1Programs.slot(m_vu1ActiveSlot).calls;
++    m_vu1XgkickBase = m_vu1Stats.xgkickStarts;
+     const uint64_t generation = getVU1CodeGeneration();
+     if (generation == m_vu1StatsHashedGeneration || !m_vu1Code)
+         return;
+@@ -2644,3 +2680,38 @@ void PS2Memory::recordVU1Mscal()
+     }
+     ++m_vu1Stats.distinctOverflow;
+ }
++
++std::vector<std::string> formatVU1ProgramHistogram(const VU1ProgramHistogram &histogram, int replayId)
++{
++    // Ordering is computed here, outside the MSCAL path.
++    std::vector<uint32_t> order;
++    order.reserve(VU1ProgramHistogram::kMaxPrograms + 1);
++    for (uint32_t i = 0; i < histogram.count; ++i)
++        order.push_back(i);
++    if (histogram.other.calls != 0)
++        order.push_back(VU1ProgramHistogram::kMaxPrograms);
++    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b)
++                     { return histogram.slot(a).execNs > histogram.slot(b).execNs; });
++
++    std::vector<std::string> lines;
++    lines.reserve(order.size());
++    for (uint32_t index : order)
++    {
++        const VU1ProgramHistogram::Entry &entry = index < VU1ProgramHistogram::kMaxPrograms ? histogram.entries[index] : histogram.other;
++        char text[256];
++        if (index < VU1ProgramHistogram::kMaxPrograms)
++            std::snprintf(text, sizeof(text), "[vu1-prog] replay=%d pc=0x%04x calls=%llu us=%.1f xgkick=%llu eeread=%llu",
++                          replayId, entry.pc, static_cast<unsigned long long>(entry.calls),
++                          static_cast<double>(entry.execNs) / 1000.0,
++                          static_cast<unsigned long long>(entry.xgkickStarts),
++                          static_cast<unsigned long long>(entry.eeReads));
++        else
++            std::snprintf(text, sizeof(text), "[vu1-prog] replay=%d pc=other calls=%llu us=%.1f xgkick=%llu eeread=%llu",
++                          replayId, static_cast<unsigned long long>(entry.calls),
++                          static_cast<double>(entry.execNs) / 1000.0,
++                          static_cast<unsigned long long>(entry.xgkickStarts),
++                          static_cast<unsigned long long>(entry.eeReads));
++        lines.emplace_back(text);
++    }
++    return lines;
++}
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 04be456..f9f96f1 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -418,7 +418,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
+-            recordVU1Mscal();
++            recordVU1Mscal(startPC);
+             if (m_vu1MscalCallback)
+                 m_vu1MscalCallback(startPC, runTop, runItop);
+             continue;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 633540e..675537d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1121,6 +1121,8 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+     m_xgkick.sourceAddress = sourceAddress;
+     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
+     m_xgkick.issueCycle = m_cycle;
++    if (m_activeMemory)
++        m_activeMemory->recordVU1Xgkick(); // diagnostics only; attributed per program by PS2Memory
+ }
+ 
+ void VU1Interpreter::advanceOneCycle()
