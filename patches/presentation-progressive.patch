@@ -1,0 +1,36 @@
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -1681,7 +1681,7 @@
+                      "single-circuit presentation should normalize the last row alpha");
+         });
+ 
+-        tc.Run("latched host presentation line-doubles interlaced field output", [](TestCase &t)
++        tc.Run("latched interlaced presentation preserves rows without field-parity wobble", [](TestCase &t)
+         {
+             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+             GSRegisters regs{};
+@@ -1732,12 +1732,17 @@
+             const uint32_t row2 = pixelAtRow(2u);
+             const uint32_t row3 = pixelAtRow(3u);
+ 
+-            t.Equals(row0, row1,
+-                     "field presentation should duplicate the active field into the next scanline");
+-            t.Equals(row2, row3,
+-                     "field presentation should duplicate later field scanlines as well");
+-            t.IsTrue(row0 != row2,
+-                     "field presentation should still preserve different source content across field rows");
++            t.Equals(row0, kLine0, "progressive presentation preserves source row zero");
++            t.Equals(row1, kLine1, "progressive presentation preserves source row one");
++            t.Equals(row2, kLine2, "progressive presentation preserves source row two");
++            t.Equals(row3, kLine3, "progressive presentation preserves source row three");
++            const auto evenFrame=latchedFrame;
++            for(uint64_t tick : {1ull,2ull,3ull}) {
++                regs.vsyncTick.store(tick);
++                gs.latchHostPresentationFrame();
++                gs.copyLatchedHostPresentationFrame(latchedFrame,latchedWidth,latchedHeight);
++                t.IsTrue(latchedFrame==evenFrame, "changing field parity cannot move an unchanged framebuffer");
++            }
+         });
+ 
+         tc.Run("GIF PACKED A+D writes DISPFB1 and DISPLAY1 privileged registers", [](TestCase &t)

@@ -1,0 +1,53 @@
+--- a/ps2xRuntime/include/runtime/gs/gs_types.h
++++ b/ps2xRuntime/include/runtime/gs/gs_types.h
+@@ -3,6 +3,7 @@
+ #include <cstddef>
+ #include <array>
+ #include <cstdint>
++#include <memory>
+ #include <vector>
+
+ enum GSPrimType : uint8_t
+@@ -290,6 +291,25 @@
+     bool hasPreferredSource = false;
+ };
+
++// Immutable completed GPU image. Leases keep its texture/context alive. The
++// producer may recycle storage only after all leases and consumer GPU work end.
++// These hooks require GL 3.3-style shared resources, never CPU-mapped GPU RAM.
++class GSGpuPresentation
++{
++public:
++    virtual ~GSGpuPresentation() = default;
++    virtual uint32_t textureId() const = 0;
++    virtual uint32_t textureWidth() const = 0;
++    virtual uint32_t textureHeight() const = 0;
++    // Called in the window's current context, before sampling and after the
++    // render batch is flushed. Waits are GPU/server-side, not CPU polling.
++    virtual void waitForDraw() const = 0;
++    virtual void finishDraw() const = 0;
++    // Explicit diagnostic path: materialize the immutable completed image in
++    // the existing 640x512 RGBA CPU layout. Ordinary presentation never calls it.
++    virtual bool readPixels(std::vector<uint8_t> &outPixels) const = 0;
++};
++
+ struct PresentationFrame
+ {
+     std::vector<uint8_t> pixels;
+@@ -298,10 +318,14 @@
+     uint32_t displayFbp = 0;
+     uint32_t sourceFbp = 0;
+     bool usedPreferred = false;
++    std::shared_ptr<GSGpuPresentation> gpu;
++    // A bounded producer with every image leased may retain the last completed
++    // image instead of blocking or adding a CPU readback to the normal path.
++    bool keepPrevious = false;
+
+     explicit operator bool() const
+     {
+-        return !pixels.empty() && width != 0u && height != 0u;
++        return (!pixels.empty() || gpu) && width != 0u && height != 0u;
+     }
+ };
+
+# End of presentation lease patch.

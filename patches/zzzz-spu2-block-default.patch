@@ -1,0 +1,13 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
+index a06983d..ef5cbd8 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2.h
+@@ -35,7 +35,7 @@ namespace ps2x::iop::detail
+             }
+             if (const char *path = std::getenv("NIGHT100_SPU_WORK_COUNTERS")) m_workPath = path;
+             const char *reference = std::getenv("NIGHT100_REFERENCE_SPU_MIX");
+-            m_referenceMix = !reference || (reference[0] && reference[0] != '0');
++            m_referenceMix = reference && reference[0] && reference[0] != '0';
+             reset();
+         }
+         ~IopSpu2() { saveCapture(); saveWorkCounters(); }

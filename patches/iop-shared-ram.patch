@@ -1,0 +1,133 @@
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -146,6 +146,7 @@
+                               const std::vector<Elf32Shdr> &sections,
+                               int64_t delta,
+                               uint32_t loadBase,
++                              uint32_t loadSize,
+                               bool isIopRelocatable,
+                               IopMemory &memory)
+         {
+@@ -237,7 +238,7 @@
+                         continue;
+                     }
+                     const uint32_t place = static_cast<uint32_t>(place64);
+-                    if (place + 3u >= IopMemory::RamSize)
++                    if (place64 < loadBase || place64 + 4u > uint64_t(loadBase) + loadSize)
+                     {
+                         allSupported = false;
+                         continue;
+@@ -396,6 +397,7 @@
+                 programHeaders.push_back(program);
+                 if (program.type == PT_LOAD && program.memsz != 0u)
+                 {
++                    if (uint64_t(program.vaddr) + program.memsz > std::numeric_limits<uint32_t>::max()) return result;
+                     hasLoad = true;
+                     minVaddr = std::min(minVaddr, program.vaddr);
+                     maxVaddr = std::max(maxVaddr, program.vaddr + program.memsz);
+@@ -414,6 +416,7 @@
+                 sectionHeaders.push_back(section);
+                 if (!hasLoad && (section.flags & SHF_ALLOC) != 0u && section.size != 0u)
+                 {
++                    if (uint64_t(section.addr) + section.size > std::numeric_limits<uint32_t>::max()) return result;
+                     minVaddr = std::min(minVaddr, section.addr);
+                     maxVaddr = std::max(maxVaddr, section.addr + section.size);
+                 }
+@@ -423,6 +426,11 @@
+         if (minVaddr == std::numeric_limits<uint32_t>::max())
+             minVaddr = 0u;
+         uint32_t span = maxVaddr > minVaddr ? maxVaddr - minVaddr : 0x1000u;
++        if (span > IopMemory::HeapLimit - IopMemory::HeapBase)
++        {
++            result.error = IopImageLoadError::ArenaExhausted;
++            return result;
++        }
+         span = alignUp(span, 0x100u);
+         const bool relocate = header.type != ET_EXEC ||
+                               maxVaddr > IopMemory::RamSize ||
+@@ -431,19 +439,28 @@
+         int64_t delta = 0;
+         if (relocate)
+         {
+-            base = alignUp(moduleCursor, 0x100u);
+-            if (base + span >= IopMemory::HeapBase)
+-            {
+-                result.error = IopImageLoadError::ArenaExhausted;
+-                return result;
+-            }
+-            delta = static_cast<int64_t>(base) - minVaddr;
+-            result.nextModuleCursor = base + span;
++            base = memory.allocate(span, 0x100u);
+         }
+         else
+         {
+-            base = minVaddr;
+-        }
++            base = memory.allocate(span, 0x100u, minVaddr);
++        }
++        if (!base)
++        {
++            result.error = IopImageLoadError::ArenaExhausted;
++            return result;
++        }
++        // A malformed image must release its reservation; successful images
++        // remain owned until module unload. Guest heap allocations can never
++        // overwrite either module code or BSS, including later module loads.
++        struct ImageReservation
++        {
++            IopMemory &memory;
++            uint32_t base;
++            bool committed = false;
++            ~ImageReservation() { if (!committed) (void)memory.freeAllocation(base); }
++        } reservation{memory, base};
++        delta = static_cast<int64_t>(base) - minVaddr;
+
+         if (hasLoad)
+         {
+@@ -455,7 +472,7 @@
+                     program.memsz < program.filesz)
+                     return result;
+                 const uint32_t destination = static_cast<uint32_t>(static_cast<int64_t>(program.vaddr) + delta);
+-                if (destination >= IopMemory::RamSize || program.memsz > IopMemory::RamSize - destination)
++                if (destination < base || destination > base + span || program.memsz > base + span - destination)
+                     return result;
+                 if (!memory.writeRam(destination, image.data() + program.offset, program.filesz))
+                     return result;
+@@ -482,7 +499,7 @@
+                     section.addr = static_cast<uint32_t>(static_cast<int64_t>(destination) - delta);
+                     sectionCursor += section.size;
+                 }
+-                if (destination >= IopMemory::RamSize || section.size > IopMemory::RamSize - destination)
++                if (destination < base || destination > base + span || section.size > base + span - destination)
+                     return result;
+                 if (section.type == SHT_NOBITS)
+                 {
+@@ -503,6 +520,7 @@
+                                                       sectionHeaders,
+                                                       delta,
+                                                       base,
++                                                      span,
+                                                       isIopRelocatable,
+                                                       memory);
+
+@@ -556,6 +574,8 @@
+         }
+
+         result.error = IopImageLoadError::None;
++        result.nextModuleCursor = base + span;
++        reservation.committed = true;
+         return result;
+     }
+ }
+diff --git a/ps2xTest/src/ps2_sif_dma_tests.cpp b/ps2xTest/src/ps2_sif_dma_tests.cpp
+index aace83c..aca5613 100644
+--- a/ps2xTest/src/ps2_sif_dma_tests.cpp
++++ b/ps2xTest/src/ps2_sif_dma_tests.cpp
+@@ -201,5 +201,5 @@ void register_ps2_sif_dma_tests()
+             ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
+             const uint32_t iopAddress = ::getRegU32(&env.ctx, 2);
+-            t.IsTrue(iopAddress >= 0x00120000u && iopAddress < 0x00200000u,
++            t.IsTrue(iopAddress >= 0x00010000u && iopAddress + kIopBlockSize <= 0x001f0000u,
+                      "sceSifAllocIopHeap should return an address in physical IOP RAM");
+             std::memset(env.rdram.data() + iopAddress, 0x5Au, payload.size());

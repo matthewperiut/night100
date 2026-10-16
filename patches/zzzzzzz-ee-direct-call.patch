@@ -1,0 +1,165 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -227,6 +227,21 @@
+     void ControlFlowEmitter::emitExternalJumpDispatch(uint32_t target, StaticBranchKind kind, std::string_view indent)
+     {
+         const bool isCall = kind == StaticBranchKind::Call;
++        const std::string calleeName = isCall ? m_gen.getFunctionName(target) : std::string();
++        if (!calleeName.empty())
++        {
++            // Known callee: dispatchDirectCall calls it inline while the function table still holds it.
++            m_ss << fmt::format(
++                "{}if (!runtime->dispatchDirectCall(rdram, ctx, &{}, 0x{:X}u, 0x{:X}u, 0x{:X}u, \"JAL\")) {{\n",
++                indent,
++                calleeName,
++                target,
++                branchPc(),
++                fallthroughPc());
++            m_ss << fmt::format("{}    return;\n", indent);
++            m_ss << fmt::format("{}}}\n", indent);
++            return;
++        }
+         emitRuntimeBranchDispatch(fmt::format("0x{:X}u", target),
+                                   branchPc(),
+                                   isCall ? fallthroughPc() : 0u,
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -363,6 +363,19 @@
+                              uint32_t fallthroughPc,
+                              GuestBranchKind kind,
+                              const char *debugName);
++    // Direct JAL: calls fn inline when the function table still maps targetPc to fn,
++    // otherwise falls back to dispatchGuestBranch. The table entry is the only
++    // per-target guard, so replaceFunction is observed on the next call. The
++    // 8-cycle checkpoint charge and the post-call PC checks match dispatchGuestBranch.
++    bool dispatchDirectCall(uint8_t *rdram,
++                            R5900Context *ctx,
++                            RecompiledFunction fn,
++                            uint32_t targetPc,
++                            uint32_t sourcePc,
++                            uint32_t fallthroughPc,
++                            const char *debugName);
++    bool hasEeScheduler() const noexcept { return m_eeScheduler != nullptr; }
++    uint64_t guestUnwindSequence() const noexcept { return m_guestUnwindSequence; }
+     void reportMissingFunction(uint8_t *rdram,
+                                R5900Context *ctx,
+                                uint32_t targetPc,
+@@ -596,5 +609,44 @@
+ extern const uint32_t g_ps2RecompiledFunctionTableEnd;
+ extern const uint32_t g_ps2RecompiledFunctionTableSlotCount;
+ extern PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[];
++
++inline bool PS2Runtime::dispatchDirectCall(uint8_t *rdram,
++                                           R5900Context *ctx,
++                                           RecompiledFunction fn,
++                                           uint32_t targetPc,
++                                           uint32_t sourcePc,
++                                           uint32_t fallthroughPc,
++                                           const char *debugName)
++{
++    const bool tableHit = (targetPc & 3u) == 0u &&
++                          targetPc >= g_ps2RecompiledFunctionTableBase &&
++                          targetPc < g_ps2RecompiledFunctionTableEnd &&
++                          g_ps2RecompiledFunctionTable[(targetPc - g_ps2RecompiledFunctionTableBase) >> 2] == fn;
++    if (!tableHit)
++    {
++        return dispatchGuestBranch(rdram, ctx, targetPc, sourcePc, fallthroughPc, GuestBranchKind::DirectCall, debugName);
++    }
+ 
++    ctx->pc = targetPc;
++    // Same charge as dispatchGuestBranch (EeScheduler::kGuestDispatchCycles, pinned by a static_assert in ps2_runtime.cpp).
++    constexpr uint32_t kDirectCallCycles = 8u;
++    if (hasEeScheduler() && eeCheckpointDue(kDirectCallCycles))
++    {
++        return false;
++    }
++
++    const uint64_t unwindSequence = guestUnwindSequence();
++    fn(rdram, ctx, this);
++
++    if (isStopRequested() || ctx->pc == 0u || guestUnwindSequence() != unwindSequence)
++    {
++        return false;
++    }
++    if (ctx->pc == targetPc)
++    {
++        ctx->pc = fallthroughPc;
++    }
++    return ctx->pc == fallthroughPc;
++}
++
+ #endif // PS2_RUNTIME_H
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1405,6 +1405,8 @@
+         requestStop();
+     }
+ }
++
++static_assert(EeScheduler::kGuestDispatchCycles == 8u, "dispatchDirectCall charges the guest dispatch cost");
+ 
+ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      R5900Context *ctx,
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -1515,14 +1515,35 @@
+             // runtime->dispatchGuestBranch(..., DirectCall, "JAL")
+ 
+             t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0xA008u);") != std::string::npos, "JAL should set RA");
+-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, 0xB000u") != std::string::npos,
+-                     "JAL should dispatch through the runtime branch helper");
+-            t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::DirectCall") != std::string::npos,
+-                     "JAL should identify itself as a direct call");
+-            t.IsTrue(generated.find("0xA000u, 0xA008u") != std::string::npos,
+-                     "JAL should pass call-site and fallthrough PCs to the runtime helper");
++            t.IsTrue(generated.find("runtime->dispatchDirectCall(rdram, ctx, &some_func") != std::string::npos,
++                     "JAL to a generated function should call it through the guarded direct helper");
++            t.IsTrue(generated.find("0xB000u, 0xA000u, 0xA008u, \"JAL\"") != std::string::npos,
++                     "JAL should pass target, call-site and fallthrough PCs to the direct helper");
++            t.IsTrue(generated.find("runtime->dispatchGuestBranch(") == std::string::npos,
++                     "JAL to a generated function should not take the table-lookup dispatch");
+         });
+ 
++        tc.Run("JAL to an unknown target keeps the table dispatch", [](TestCase &t) {
++            Function func;
++            func.name = "jal_unknown";
++            func.start = 0xA200;
++            func.end = 0xA208;
++            func.isRecompiled = true;
++            func.isStub = false;
++
++            Instruction jal = makeJal(0xA200, 0xB300);
++            Instruction delay = makeNop(0xA204);
++
++            CodeGenerator gen({}, {});
++            std::string generated = gen.generateFunction(func, {jal, delay}, false);
++            printGeneratedCode("JAL to an unknown target keeps the table dispatch", generated);
++
++            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, 0xB300u") != std::string::npos,
++                     "JAL to an unresolved target should dispatch through the runtime table");
++            t.IsTrue(generated.find("dispatchDirectCall") == std::string::npos,
++                     "JAL to an unresolved target must not reference a generated function");
++        });
++
+         tc.Run("JAL to a resolved syscall publishes fallthrough before the handler", [](TestCase &t) {
+             Function func;
+             func.name = "jal_syscall_resume";
+@@ -1573,10 +1594,10 @@
+ 
+             t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0xA108u);") != std::string::npos,
+                      "truncated trailing JAL should still set RA");
+-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, 0xB000u") != std::string::npos,
+-                     "truncated trailing JAL should still emit the call dispatch");
+-            t.IsTrue(generated.find("0xA100u, 0xA108u") != std::string::npos,
+-                     "truncated trailing JAL should still pass the fallthrough to runtime dispatch");
++            t.IsTrue(generated.find("runtime->dispatchDirectCall(rdram, ctx, &some_func") != std::string::npos,
++                     "truncated trailing JAL should still emit the call through the direct helper");
++            t.IsTrue(generated.find("0xB000u, 0xA100u, 0xA108u") != std::string::npos,
++                     "truncated trailing JAL should still pass the fallthrough to the direct helper");
+             t.IsTrue(generated.find("// JAL 0xB000 - Handled by branch logic") == std::string::npos,
+                      "truncated trailing JAL must not degrade to comment-only output");
+         });

@@ -1,0 +1,19 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -478,8 +478,13 @@
+                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
+                 if (pos + copyBytes <= sizeBytes)
+                 {
+-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+-                    markVU1CodeModified();
++                    // Identical microcode decodes identically, so re-uploading it
++                    // must not invalidate the VU1 decode cache.
++                    if (std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) != 0)
++                    {
++                        std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
++                        markVU1CodeModified();
++                    }
+                 }
+             }
+             pos += mpgBytes;

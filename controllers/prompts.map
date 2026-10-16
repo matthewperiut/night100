@@ -1,0 +1,11 @@
+NIGHT100_PROMPTS 1
+be3460f2b2f32834 256 256 0 132 18 22 circle.png a.png
+be3460f2b2f32834 256 256 18 132 18 22 square.png y.png
+be3460f2b2f32834 256 256 36 132 18 22 triangle.png x.png
+be3460f2b2f32834 256 256 54 132 18 22 cross.png b.png
+089d88bddeb8e1d6 128 128 0 0 18 17 menu_triangle.png menu_x.png
+089d88bddeb8e1d6 128 128 0 17 18 18 menu_cross.png menu_b.png
+810e6dcda1e47e01 128 128 64 0 16 17 diagram_triangle.png diagram_x.png
+810e6dcda1e47e01 128 128 80 0 16 17 diagram_square.png diagram_y.png
+810e6dcda1e47e01 128 128 96 0 16 17 diagram_circle.png diagram_a.png
+810e6dcda1e47e01 128 128 112 0 16 17 diagram_cross.png diagram_b.png

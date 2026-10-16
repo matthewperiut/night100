@@ -1,0 +1,68 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 37a2bbe..cd1031a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1466,6 +1466,63 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+     const uint32_t dsax = m_transfer.trxpos.dsax;
+     uint32_t offset = 0u;
+ 
++    // Direct 32/16-bit path. Same pixel order, state updates and partial-chunk
++    // behaviour as the generic loop below; it avoids a per-pixel division and
++    // an indirect call through m_writeVramFuncs.
++    if (dpsm == GS_PSM_CT32 || dpsm == GS_PSM_CT16 || dpsm == GS_PSM_CT16S)
++    {
++        const uint32_t bytesPerPixel = (dpsm == GS_PSM_CT32) ? 4u : 2u;
++        const uint32_t totalPixels = m_transferState.totalPixels;
++        const uint32_t dsay = m_transfer.trxpos.dsay;
++        uint32_t copied = m_transferState.copiedPixels;
++        uint32_t x = m_transferState.x;
++        uint32_t y = m_transferState.y;
++        uint32_t column = copied % rrw;
++        uint32_t row = copied / rrw;
++        uint32_t direction = m_transferState.direction;
++        while (offset < sizeBytes && direction == 0u)
++        {
++            if (sizeBytes - offset < bytesPerPixel)
++                break;
++            if (bytesPerPixel == 4u)
++            {
++                uint32_t value = 0u;
++                std::memcpy(&value, data + offset, sizeof(value));
++                GSMem::WriteCT32(m_vram, dbp, dbw, x, y, value);
++            }
++            else
++            {
++                uint16_t value = 0u;
++                std::memcpy(&value, data + offset, sizeof(value));
++                if (dpsm == GS_PSM_CT16)
++                    GSMem::WriteCT16(m_vram, dbp, dbw, x, y, value);
++                else
++                    GSMem::WriteCT16S(m_vram, dbp, dbw, x, y, value);
++            }
++            offset += bytesPerPixel;
++
++            copied = std::min<uint32_t>(totalPixels, copied + 1u);
++            if (copied >= totalPixels)
++            {
++                direction = 3u;
++                m_transferState.totalPixels = 0u;
++                break;
++            }
++            if (++column == rrw)
++            {
++                column = 0u;
++                ++row;
++            }
++            x = dsax + column;
++            y = dsay + row;
++        }
++        m_transferState.copiedPixels = copied;
++        m_transferState.x = x;
++        m_transferState.y = y;
++        m_transferState.direction = direction;
++        return;
++    }
++
+     auto advancePixel = [&](uint32_t count)
+     {
+         const uint32_t totalPixels = m_transferState.totalPixels;

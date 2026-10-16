@@ -1,0 +1,224 @@
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -339,7 +339,14 @@
+     template<class Archive> void state(Archive &ar)
+     {
+         // A Reader replaces map nodes, including on a partially failed load.
+-        if constexpr(Archive::loading)m_cachedGifStat=nullptr;
++        if constexpr(Archive::loading)
++        {
++            m_cachedGifStat=nullptr;
++            // Deferred cycles belong to the replaced timeline.
++            m_eeTimerPendingCycles=0;
++            m_eeTimerLatchedInterrupts=0;
++            m_eeTimerNextEventValid=false;
++        }
+         if (!m_rdram || !m_scratchpad || !m_gsVRAM || !iop_ram ||
+             !m_vu0Code || !m_vu0Data || !m_vu1Code || !m_vu1Data)
+             throw std::runtime_error("Snapshot requires initialized PS2 memory");
+@@ -362,6 +369,7 @@
+         ar(m_path3Masked,m_vif1PendingPath2ImageQwc,m_vif1PendingPath2DirectHl,
+            m_path3MaskedFifo,m_pendingGifTransfers,m_pendingVif0Transfers,m_pendingVif1Transfers,
+            m_completedDmacCauses,m_codeRegions);
++        if constexpr(!Archive::loading)flushEeTimers();
+         ar.pod(m_eeTimers);
+         auto atomic=[&](auto &field){uint64_t value=field.load();ar(value);if constexpr(Archive::loading)field.store(value);};
+         atomic(m_dmaStartCount);atomic(m_gifCopyCount);atomic(m_gsWriteCount);atomic(m_vifWriteCount);
+@@ -440,6 +448,12 @@
+     uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
+     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
+     void resetEeTimers() noexcept;
++    // Scheduler checkpoint form of advanceEeTimers. Timer clocks are applied
++    // lazily: the result is identical to advancing at every checkpoint because
++    // every timer register access, state save and cycle query flushes first.
++    uint32_t accumulateEeTimerCycles(uint64_t eeCycles) noexcept;
++    void flushEeTimers() noexcept;
++    [[nodiscard]] uint32_t takeEeTimerInterrupts() noexcept;
+ 
+     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
+     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
+@@ -598,6 +612,17 @@
+     // references survive insertion/rehash; initialize and state Reader are the
+     // only runtime operations that discard nodes and invalidate this pointer.
+     uint32_t* m_cachedGifStat=nullptr;
++    // Deferred EE timer clocks. The logical timer time is applied state plus
++    // m_eeTimerPendingCycles. m_eeTimerCyclesToEvent is the exact distance from
++    // that logical time to the next interrupt. When m_eeTimerNextEventValid is
++    // false, pending cycles are zero and the distance must be recomputed.
++    uint64_t m_eeTimerPendingCycles = 0;
++    uint64_t m_eeTimerCyclesToEvent = 0;
++    uint32_t m_eeTimerLatchedInterrupts = 0;
++    bool m_eeTimerNextEventValid = false;
++    void clearGifFqcForCheckpoint() noexcept;
++    uint32_t advanceEeTimerClocks(uint64_t eeCycles) noexcept;
++    [[nodiscard]] uint64_t eeTimerCyclesToEvent() const noexcept;
+ };
+ 
+ #endif // PS2_MEMORY_H
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -424,15 +424,13 @@
+ void PS2Memory::resetEeTimers() noexcept
+ {
+     m_eeTimers = {};
++    m_eeTimerPendingCycles = 0u;
++    m_eeTimerLatchedInterrupts = 0u;
++    m_eeTimerNextEventValid = false;
+ }
+ 
+-uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
++void PS2Memory::clearGifFqcForCheckpoint() noexcept
+ {
+-    if (eeCycles == 0u)
+-    {
+-        return 0u;
+-    }
+-
+     constexpr uint32_t kGifStat = 0x10003020u;
+     constexpr uint32_t kGifFqcMask = 0x1F000000u;
+     if (!m_cachedGifStat)
+@@ -443,7 +441,101 @@
+         if (found != m_ioRegisters.end())m_cachedGifStat = &found->second;
+     }
+     if (m_cachedGifStat)*m_cachedGifStat &= ~kGifFqcMask;
++}
++
++uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
++{
++    if (eeCycles == 0u)
++    {
++        return 0u;
++    }
++    // Eager form: apply any deferred cycles first, then this checkpoint. The
++    // logical timer time moves outside the cached distance, so invalidate it.
++    flushEeTimers();
++    m_eeTimerNextEventValid = false;
++    clearGifFqcForCheckpoint();
++    return takeEeTimerInterrupts() | advanceEeTimerClocks(eeCycles);
++}
++
++void PS2Memory::flushEeTimers() noexcept
++{
++    // Deferred cycles were proven to contain no interrupt, so the result is
++    // always empty here; it is latched anyway and never dropped.
++    const uint64_t pending = m_eeTimerPendingCycles;
++    if (pending == 0u)
++    {
++        return;
++    }
++    m_eeTimerPendingCycles = 0u;
++    m_eeTimerLatchedInterrupts |= advanceEeTimerClocks(pending);
++}
++
++uint32_t PS2Memory::takeEeTimerInterrupts() noexcept
++{
++    const uint32_t mask = m_eeTimerLatchedInterrupts;
++    m_eeTimerLatchedInterrupts = 0u;
++    return mask;
++}
++
++uint64_t PS2Memory::eeTimerCyclesToEvent() const noexcept
++{
++    // The exact distance formula assumes canonical phases. A noncanonical
++    // restored phase keeps the eager path until one checkpoint canonicalizes it.
++    for (const EeTimer &timer : m_eeTimers)
++    {
++        if (timer.clockRemainder >= kEeClockHz)
++        {
++            return 0u;
++        }
++    }
++    return cyclesUntilNextEeTimerInterrupt();
++}
+ 
++uint32_t PS2Memory::accumulateEeTimerCycles(uint64_t eeCycles) noexcept
++{
++    if (eeCycles == 0u)
++    {
++        return 0u;
++    }
++    clearGifFqcForCheckpoint();
++    if (kReferenceEeTimers)
++    {
++        // The reference oracle advances every checkpoint; nothing is deferred.
++        return advanceEeTimerClocks(eeCycles);
++    }
++    if (!m_eeTimerNextEventValid)
++    {
++        m_eeTimerCyclesToEvent = eeTimerCyclesToEvent();
++        m_eeTimerNextEventValid = true;
++    }
++
++    // Cycles before the first interrupt cannot change any interrupt bit; they
++    // only move COUNT and the rational phase, which are applied at flush time.
++    constexpr uint64_t kMaxDeferredCycles = uint64_t{1} << 40;
++    if (eeCycles < m_eeTimerCyclesToEvent && eeCycles < kMaxDeferredCycles - m_eeTimerPendingCycles)
++    {
++        m_eeTimerPendingCycles += eeCycles;
++        if (m_eeTimerCyclesToEvent != std::numeric_limits<uint64_t>::max())
++        {
++            m_eeTimerCyclesToEvent -= eeCycles;
++        }
++        return takeEeTimerInterrupts();
++    }
++
++    // An interrupt is due, or the deferral bound was reached. Apply the older
++    // cycles, then this checkpoint, exactly as two sequential advances.
++    flushEeTimers();
++    m_eeTimerNextEventValid = false;
++    return takeEeTimerInterrupts() | advanceEeTimerClocks(eeCycles);
++}
++
++__attribute__((always_inline)) inline uint32_t PS2Memory::advanceEeTimerClocks(uint64_t eeCycles) noexcept
++{
++    if (eeCycles == 0u)
++    {
++        return 0u;
++    }
++
+     uint32_t interruptMask = 0u;
+     for (size_t index = 0; index < m_eeTimers.size(); ++index)
+     {
+@@ -1181,6 +1273,9 @@
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        // Apply deferred cycles under the old configuration before any change.
++        flushEeTimers();
++        m_eeTimerNextEventValid = false;
+         EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+@@ -2337,6 +2432,7 @@
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        flushEeTimers();
+         const EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -499,7 +499,7 @@
+ {
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_eeCycle += elapsed;
+-    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
++    m_pendingEeTimerInterrupts |= m_runtime.memory().accumulateEeTimerCycles(elapsed);
+     m_runtime.advanceIopEeCycles(elapsed);
+     if (m_pendingEeTimerInterrupts != 0u)
+     {
+@@ -2124,6 +2124,13 @@
+     {
+         return;
+     }
++    // The distance query reads exact COUNT and phase, so apply deferred cycles.
++    m_runtime.memory().flushEeTimers();
++    if (const uint32_t flushed = m_runtime.memory().takeEeTimerInterrupts())
++    {
++        m_pendingEeTimerInterrupts |= flushed;
++        m_checkpointPending.store(true, std::memory_order_release);
++    }
+     const uint64_t timerCycles = m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
+     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
+     if (m_deadlines.empty() && !hasTimerDeadline)

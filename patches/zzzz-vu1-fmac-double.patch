@@ -1,0 +1,242 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -33,6 +33,22 @@
+     {
+         return static_cast<uint8_t>(1u << (3u - component));
+     }
++
++    // The single switch between the double fast path and the long double
++    // reference path (the reference is what the Switch build previously ran).
++    // Set to false to route every FMAC decision through long double.
++    constexpr bool kFmacDoublePath = true;
++
++    // Knuth TwoSum. Returns true when a + b is exactly representable in double;
++    // then sum holds the exact value, with IEEE round-to-nearest signed zeros.
++    // Inputs are finite and far from double's range limits (see the FMAC notes).
++    inline bool exactDoubleSum(double a, double b, double &sum)
++    {
++        sum = a + b;
++        const double bv = sum - a;
++        const double err = (a - (sum - bv)) + (b - bv);
++        return err == 0.0;
++    }
+ }
+ 
+ void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
+@@ -200,6 +216,19 @@
+         if ((dest & laneForComponent(component)) == 0u)
+             continue;
+ 
++        // Fast path: only taken when the exact result is representable in
++        // double, which makes it equal to the correctly rounded long double
++        // value, so flags and the special-case values are identical.
++        if (kFmacDoublePath)
++        {
++            double exactDouble = 0.0;
++            if (calculateFmacExactResultDouble(component, exactDouble))
++            {
++                laneFlags[component] = normalizeFmacExactResultDouble(result[component], exactDouble);
++                continue;
++            }
++        }
++
+         long double exactResult = 0.0L;
+         if (calculateFmacExactResult(component, exactResult))
+         {
+@@ -425,7 +454,168 @@
+ 
+     return flags;
+ }
++
++// Mirrors calculateFmacExactResult with double. Operands are floats after
++// normalizeOperand (zero or normal, finite), so every product of two operands
++// is exact in double (48 significant bits, exponent within double range).
++// Only additions can round; each one is checked with exactDoubleSum, and any
++// inexact or unsupported case returns false so the long double path decides.
++bool VU1Interpreter::calculateFmacExactResultDouble(uint32_t component,
++                                                    double &result) const
++{
++    const uint32_t upper = m_currentUpperInstruction;
++    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
++    const uint8_t special = op >= 0x3Cu
++                                ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu))
++                                : 0xFFu;
++    const uint8_t fs = FS(upper);
++    const uint8_t ft = FT(upper);
++
++    const auto operand = [this](float value)
++    {
++        return static_cast<double>(normalizeOperand(value));
++    };
++    const auto vs = [&](uint32_t lane)
++    {
++        return operand(m_state.vf[fs][lane]);
++    };
++    const auto vt = [&](uint32_t lane)
++    {
++        return operand(m_state.vf[ft][lane]);
++    };
++    const auto acc = [&](uint32_t lane)
++    {
++        return operand(m_state.acc[lane]);
++    };
+ 
++    bool exact = true;
++    const auto add = [&exact](double a, double b)
++    {
++        double sum = 0.0;
++        exact = exactDoubleSum(a, b, sum) && exact;
++        return sum;
++    };
++
++    const double q = operand(m_state.q);
++    const double i = operand(m_state.i);
++
++    // Same opcode table as calculateFmacExactResult. accumulate2E selects the
++    // lower-branch 0x2E form (acc - vs*vt) versus the special-branch form (vs*vt).
++    const auto evaluate = [&](uint8_t code, bool accumulate2E) -> bool
++    {
++        if (code <= 0x03u)
++            result = add(vs(component), vt(code & 3u));
++        else if (code <= 0x07u)
++            result = add(vs(component), -vt(code & 3u));
++        else if (code <= 0x0Bu)
++            result = add(acc(component), vs(component) * vt(code & 3u));
++        else if (code <= 0x0Fu)
++            result = add(acc(component), -(vs(component) * vt(code & 3u)));
++        else if (code >= 0x18u && code <= 0x1Bu)
++            result = vs(component) * vt(code & 3u);
++        else
++        {
++            switch (code)
++            {
++            case 0x1Cu:
++                result = vs(component) * q;
++                break;
++            case 0x1Eu:
++                result = vs(component) * i;
++                break;
++            case 0x20u:
++                result = add(vs(component), q);
++                break;
++            case 0x21u:
++                result = add(acc(component), vs(component) * q);
++                break;
++            case 0x22u:
++                result = add(vs(component), i);
++                break;
++            case 0x23u:
++                result = add(acc(component), vs(component) * i);
++                break;
++            case 0x24u:
++                result = add(vs(component), -q);
++                break;
++            case 0x25u:
++                result = add(acc(component), -(vs(component) * q));
++                break;
++            case 0x26u:
++                result = add(vs(component), -i);
++                break;
++            case 0x27u:
++                result = add(acc(component), -(vs(component) * i));
++                break;
++            case 0x28u:
++                result = add(vs(component), vt(component));
++                break;
++            case 0x29u:
++                result = add(acc(component), vs(component) * vt(component));
++                break;
++            case 0x2Au:
++                result = vs(component) * vt(component);
++                break;
++            case 0x2Cu:
++                result = add(vs(component), -vt(component));
++                break;
++            case 0x2Du:
++                result = add(acc(component), -(vs(component) * vt(component)));
++                break;
++            case 0x2Eu:
++            {
++                static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
++                static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
++                if (component == 3u)
++                    result = 0.0;
++                else if (accumulate2E)
++                    result = add(acc(component), -(vs(left[component]) * vt(right[component])));
++                else
++                    result = vs(left[component]) * vt(right[component]);
++                break;
++            }
++            default:
++                return false;
++            }
++        }
++        return true;
++    };
++
++    const bool supported = op < 0x3Cu ? evaluate(op, true) : evaluate(special, false);
++    return supported && exact;
++}
++
++// Same classification as normalizeFmacExactResult, for a double exact value.
++uint8_t VU1Interpreter::normalizeFmacExactResultDouble(float &value,
++                                                       double exactResult) const
++{
++    const bool negative = std::signbit(exactResult);
++    const double magnitude = std::fabs(exactResult);
++    const double maximum = static_cast<double>(std::numeric_limits<float>::max());
++    const double minimum = static_cast<double>(std::numeric_limits<float>::min());
++    uint8_t flags = negative ? 0x2u : 0u;
++
++    uint32_t bits = negative ? 0x80000000u : 0u;
++    if (magnitude == 0.0)
++    {
++        flags |= 0x1u;
++        std::memcpy(&value, &bits, sizeof(value));
++    }
++    else if (magnitude > maximum)
++    {
++        flags |= 0x8u;
++        bits |= 0x7F7FFFFFu;
++        std::memcpy(&value, &bits, sizeof(value));
++    }
++    else if (magnitude < minimum)
++    {
++        flags |= 0x5u;
++        std::memcpy(&value, &bits, sizeof(value));
++    }
++
++    return flags;
++}
++
+ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+ {
+     uint32_t extraSticky = 0u;
+@@ -474,9 +664,12 @@
+             right = normalizeOperand(m_state.vf[ft][component]);
+         }
+ 
++        // Two floats multiply exactly in double (see calculateFmacExactResultDouble),
++        // so the double classification is always exact here.
+         float product = left * right;
+-        const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
+-        const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
++        const uint8_t productFlags = kFmacDoublePath
++            ? normalizeFmacExactResultDouble(product, static_cast<double>(left) * static_cast<double>(right))
++            : normalizeFmacExactResult(product, static_cast<long double>(left) * static_cast<long double>(right));
+         // Product-sum instructions report Z/S/U/O from the add/subtract result
+         // as current flags, while every product condition accumulates into the
+         // corresponding sticky flag.
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -331,6 +331,8 @@
+     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
+     bool calculateFmacExactResult(uint32_t component, long double &result) const;
+     uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
++    bool calculateFmacExactResultDouble(uint32_t component, double &result) const;
++    uint8_t normalizeFmacExactResultDouble(float &value, double exactResult) const;
+     uint32_t calculateFmacProductSticky(uint8_t dest) const;
+     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
+     void queueFsset(uint16_t immediate);
